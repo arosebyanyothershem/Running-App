@@ -94,8 +94,76 @@ export default function App() {
     const fiveKseconds = setup.fiveKminutes * 60 + setup.fiveKseconds;
     const paces = computePaces(fiveKseconds);
     const hr = computeHRzones(setup.maxHR);
-    const newPlan = generatePlan({
-      weeks: setup.weeks,
+
+    // If there's no existing plan, just generate fresh
+    if (!plan) {
+      const newPlan = generatePlan({
+        weeks: setup.weeks,
+        daysPerWeek: setup.daysPerWeek,
+        startingMiles: setup.startingMiles,
+        recovering: setup.recovering,
+        paces,
+        hr,
+        preferredLongDay: setup.longDay,
+        preferredQualityDays: setup.qualityDays,
+        startDate: setup.startDate,
+      });
+      setPlan(newPlan);
+      setCurrentWeekIdx(0);
+      setCompletions({});
+      savePlan(newPlan);
+      saveSetup(setup);
+      saveCompletions({});
+      setView('week');
+      return;
+    }
+
+    // Smart regeneration: preserve past weeks (those that have ended), regenerate future weeks
+    const today = todayISO();
+
+    // A "past week" = a week whose last day (Sunday) is strictly before today
+    // We keep past weeks intact, including their completions and any manual moves
+    const pastWeeks = plan.filter(w => w.days[6] && w.days[6].date < today);
+    const pastWeekCount = pastWeeks.length;
+
+    if (pastWeekCount === 0) {
+      // No weeks have passed yet — confirm full regeneration
+      if (!confirm('Regenerate the entire plan? Your current completion history will be cleared.')) return;
+      const newPlan = generatePlan({
+        weeks: setup.weeks,
+        daysPerWeek: setup.daysPerWeek,
+        startingMiles: setup.startingMiles,
+        recovering: setup.recovering,
+        paces,
+        hr,
+        preferredLongDay: setup.longDay,
+        preferredQualityDays: setup.qualityDays,
+        startDate: setup.startDate,
+      });
+      setPlan(newPlan);
+      setCurrentWeekIdx(0);
+      setCompletions({});
+      savePlan(newPlan);
+      saveSetup(setup);
+      saveCompletions({});
+      setView('week');
+      return;
+    }
+
+    // Past weeks exist — confirm partial regeneration
+    const message = `Regenerate plan?\n\n• Weeks 1–${pastWeekCount} have already happened — they'll be kept along with your completion checkmarks.\n• Weeks ${pastWeekCount + 1}+ will be rebuilt with your new settings.\n\nContinue?`;
+    if (!confirm(message)) return;
+
+    // Find the start date for the future portion: the day after the last past week ends
+    const lastPastWeek = pastWeeks[pastWeeks.length - 1];
+    const lastPastEnd = new Date(lastPastWeek.days[6].date);
+    lastPastEnd.setDate(lastPastEnd.getDate() + 1);
+    const futureStartDate = lastPastEnd.toISOString().slice(0, 10);
+
+    const futureWeekCount = Math.max(1, setup.weeks - pastWeekCount);
+
+    const futureWeeksRaw = generatePlan({
+      weeks: futureWeekCount,
       daysPerWeek: setup.daysPerWeek,
       startingMiles: setup.startingMiles,
       recovering: setup.recovering,
@@ -103,14 +171,39 @@ export default function App() {
       hr,
       preferredLongDay: setup.longDay,
       preferredQualityDays: setup.qualityDays,
-      startDate: setup.startDate,
+      startDate: futureStartDate,
     });
-    setPlan(newPlan);
-    setCurrentWeekIdx(0);
-    setCompletions({});
-    savePlan(newPlan);
+
+    // Renumber the future weeks so weekIndex stays globally unique and continues from past weeks
+    const futureWeeks = futureWeeksRaw.map((w, i) => ({
+      ...w,
+      weekIndex: pastWeekCount + i,
+      label: `Week ${pastWeekCount + i + 1}`,
+    }));
+
+    const mergedPlan = [...pastWeeks, ...futureWeeks];
+
+    // Filter completions to only keep those tied to past weeks (their session IDs remain valid)
+    const validKeys = new Set();
+    pastWeeks.forEach((w, wi) => {
+      w.days.forEach((d, di) => {
+        d.sessions.forEach(s => {
+          validKeys.add(`${w.weekIndex}-${di}-${s.id}`);
+        });
+      });
+    });
+    const filteredCompletions = {};
+    Object.keys(completions).forEach(k => {
+      if (validKeys.has(k)) filteredCompletions[k] = completions[k];
+    });
+
+    setPlan(mergedPlan);
+    setCompletions(filteredCompletions);
+    savePlan(mergedPlan);
     saveSetup(setup);
-    saveCompletions({});
+    saveCompletions(filteredCompletions);
+    // Jump to the first regenerated week so user sees the change
+    setCurrentWeekIdx(pastWeekCount);
     setView('week');
   };
 
@@ -141,6 +234,55 @@ export default function App() {
     });
     setPlan(newPlan);
     savePlan(newPlan);
+  };
+
+  const handleBackup = () => {
+    const backup = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      setup,
+      plan,
+      completions,
+    };
+    const content = JSON.stringify(backup, null, 2);
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const today = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `singles-plan-backup-${today}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+  };
+
+  const handleRestore = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data.plan || !data.setup) {
+          alert('That file does not look like a Singles Planner backup.');
+          return;
+        }
+        if (plan && !confirm('Restore from backup? This will REPLACE your current plan and completion history.')) {
+          return;
+        }
+        setSetup(data.setup);
+        setPlan(data.plan);
+        setCompletions(data.completions || {});
+        saveSetup(data.setup);
+        savePlan(data.plan);
+        saveCompletions(data.completions || {});
+        setCurrentWeekIdx(0);
+        setView('week');
+        alert('Backup restored.');
+      } catch (err) {
+        alert('Could not read the backup file: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
   };
 
   if (loading) {
@@ -176,7 +318,15 @@ export default function App() {
 
       <main className="max-w-5xl mx-auto px-4 py-4">
         {view === 'setup' && (
-          <SetupForm setup={setup} onChange={setSetup} onGenerate={handleGenerate} onReset={plan ? handleReset : null} />
+          <SetupForm
+            setup={setup}
+            onChange={setSetup}
+            onGenerate={handleGenerate}
+            onReset={plan ? handleReset : null}
+            onBackup={handleBackup}
+            onRestore={handleRestore}
+            hasPlan={!!plan}
+          />
         )}
         {view === 'week' && plan && (
           <WeekView
@@ -238,12 +388,23 @@ function NavButton({ icon: Icon, label, active, onClick }) {
   );
 }
 
-function SetupForm({ setup, onChange, onGenerate, onReset }) {
+function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, hasPlan }) {
   const update = (patch) => onChange({ ...setup, ...patch });
   const toggleQualityDay = (d) => {
     const has = setup.qualityDays.includes(d);
     const next = has ? setup.qualityDays.filter(x => x !== d) : [...setup.qualityDays, d].sort();
     update({ qualityDays: next.slice(0, 3) });
+  };
+
+  const handleRestoreClick = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.onchange = (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (file) onRestore(file);
+    };
+    input.click();
   };
 
   return (
@@ -347,7 +508,7 @@ function SetupForm({ setup, onChange, onGenerate, onReset }) {
       <div className="flex flex-col sm:flex-row gap-2 mt-6">
         <button onClick={onGenerate}
           className="px-5 py-2.5 bg-slate-900 text-white rounded-md font-medium text-sm hover:bg-slate-800 transition">
-          Generate plan
+          {hasPlan ? 'Regenerate plan' : 'Generate plan'}
         </button>
         {onReset && (
           <button onClick={onReset}
@@ -355,6 +516,26 @@ function SetupForm({ setup, onChange, onGenerate, onReset }) {
             <RotateCcw className="h-3.5 w-3.5" /> Reset plan
           </button>
         )}
+      </div>
+
+      {/* Backup & restore section */}
+      <div className="mt-8 pt-5 border-t border-slate-200">
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">Backup & restore</h3>
+        <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+          Your plan and completion history live in this browser only. Download a backup periodically — store it in iCloud, Google Drive, or email it to yourself. Restore it on another device or after clearing your browser.
+        </p>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <button onClick={onBackup} disabled={!hasPlan}
+            className="flex-1 px-4 py-2 bg-emerald-50 text-emerald-900 border border-emerald-200 rounded-md font-medium text-sm hover:bg-emerald-100 transition flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
+            <Download className="h-3.5 w-3.5" />
+            Download backup
+          </button>
+          <button onClick={handleRestoreClick}
+            className="flex-1 px-4 py-2 bg-blue-50 text-blue-900 border border-blue-200 rounded-md font-medium text-sm hover:bg-blue-100 transition flex items-center justify-center gap-1.5">
+            <Share2 className="h-3.5 w-3.5" />
+            Restore from backup
+          </button>
+        </div>
       </div>
     </div>
   );

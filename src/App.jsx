@@ -217,6 +217,7 @@ export default function App() {
       {selectedSession && (
         <SessionModal
           session={selectedSession.session}
+          onMoveStart={selectedSession.onMoveStart}
           paces={paces}
           onClose={() => setSelectedSession(null)}
         />
@@ -359,15 +360,24 @@ function SetupForm({ setup, onChange, onGenerate, onReset }) {
   );
 }
 
-function SessionCard({ session, completed, onToggle, draggable, onDragStart, onClick, date }) {
+function SessionCard({ session, completed, onToggle, isMoveMode, isSelected, isMovableInMode, onSelectAsMoveTarget, onClick }) {
   const style = SESSION_COLORS[session.type] || SESSION_COLORS.easy;
   const Icon = style.icon;
+
+  const handleCardClick = (e) => {
+    // In move mode, tapping does nothing on the card itself (the whole day handles the tap)
+    if (isMoveMode) return;
+    onClick && onClick();
+  };
+
   return (
     <div
-      draggable={draggable}
-      onDragStart={(e) => onDragStart && onDragStart(e, session)}
-      onClick={onClick}
-      className={`group rounded-lg border ${style.border} ${style.bg} p-2 transition ${completed ? 'opacity-60' : ''} ${draggable ? 'cursor-pointer hover:shadow-sm' : 'cursor-pointer'}`}
+      onClick={handleCardClick}
+      className={`group rounded-lg border ${style.border} ${style.bg} p-2 transition cursor-pointer ${
+        completed ? 'opacity-60' : ''
+      } ${isSelected ? 'ring-2 ring-slate-900 shadow-lg' : ''} ${
+        isMoveMode && !isSelected ? 'opacity-50' : ''
+      }`}
     >
       <div className="flex items-start gap-2">
         <button
@@ -397,22 +407,31 @@ function SessionCard({ session, completed, onToggle, draggable, onDragStart, onC
 }
 
 function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onToggleCompletion, onMoveSession, onSessionClick }) {
-  const [dragging, setDragging] = useState(null);
+  // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
+  const [moveSelection, setMoveSelection] = useState(null);
   const week = plan[currentWeekIdx];
   if (!week) return null;
 
-  const handleDragStart = (e, session, fromDay) => {
-    setDragging({ session, fromDay });
-    e.dataTransfer.effectAllowed = 'move';
-  };
-  const handleDrop = (e, toDay) => {
-    e.preventDefault();
-    if (dragging && dragging.fromDay !== toDay) {
-      onMoveSession(week.weekIndex, dragging.fromDay, toDay, dragging.session.id);
+  const isMoveMode = moveSelection !== null;
+
+  const handleSelectForMove = (fromDay, sessionId) => {
+    if (moveSelection && moveSelection.sessionId === sessionId) {
+      // Tapping the selected card again cancels move mode
+      setMoveSelection(null);
+    } else {
+      setMoveSelection({ fromDay, sessionId });
     }
-    setDragging(null);
   };
-  const handleDragOver = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+
+  const handleDayTap = (toDay) => {
+    if (!moveSelection) return;
+    if (moveSelection.fromDay !== toDay) {
+      onMoveSession(week.weekIndex, moveSelection.fromDay, toDay, moveSelection.sessionId);
+    }
+    setMoveSelection(null);
+  };
+
+  const cancelMove = () => setMoveSelection(null);
 
   let totalCount = 0, doneCount = 0;
   week.days.forEach((d, i) => {
@@ -448,16 +467,36 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
         </button>
       </div>
 
+      {/* Move-mode banner */}
+      {isMoveMode && (
+        <div className="mb-3 bg-slate-900 text-white rounded-lg p-3 flex items-center justify-between gap-3 sticky top-14 z-10 shadow-lg">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <GripVertical className="h-4 w-4 flex-shrink-0" />
+            <p className="text-sm font-medium truncate">Tap a day to move this session there</p>
+          </div>
+          <button onClick={cancelMove}
+            className="text-xs px-3 py-1 bg-white/10 hover:bg-white/20 rounded-md font-medium flex-shrink-0">
+            Cancel
+          </button>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 sm:grid-cols-7 gap-2">
         {week.days.map((day, idx) => {
           const today = day.date && isToday(day.date);
           const d = day.date ? new Date(day.date) : null;
           const dateDisplay = d ? `${d.getMonth() + 1}/${d.getDate()}` : '';
+          const isMoveTarget = isMoveMode && moveSelection.fromDay !== idx;
+          const isSourceDay = isMoveMode && moveSelection.fromDay === idx;
+
           return (
             <div key={idx}
-              onDrop={(e) => handleDrop(e, idx)}
-              onDragOver={handleDragOver}
-              className={`rounded-lg border-2 bg-white p-2 min-h-[90px] transition ${today ? 'border-slate-900 shadow-sm' : 'border-slate-100'} ${dragging ? 'hover:border-slate-400' : ''}`}
+              onClick={() => isMoveTarget && handleDayTap(idx)}
+              className={`rounded-lg border-2 bg-white p-2 min-h-[90px] transition ${
+                today ? 'border-slate-900 shadow-sm' : 'border-slate-100'
+              } ${isMoveTarget ? 'border-emerald-400 bg-emerald-50 cursor-pointer hover:bg-emerald-100 hover:border-emerald-500' : ''} ${
+                isSourceDay ? 'border-slate-400 bg-slate-50' : ''
+              }`}
             >
               <div className="flex items-baseline justify-between mb-1.5">
                 <div>
@@ -467,6 +506,7 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                   {dateDisplay && <p className="text-[10px] text-slate-400">{dateDisplay}</p>}
                 </div>
                 {today && <span className="text-[9px] font-bold text-white bg-slate-900 rounded px-1.5 py-0.5">TODAY</span>}
+                {isMoveTarget && <span className="text-[9px] font-bold text-emerald-700 bg-emerald-100 rounded px-1.5 py-0.5">↓ MOVE HERE</span>}
               </div>
               <div className="space-y-1">
                 {(() => {
@@ -480,7 +520,9 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                           return (
                             <SessionCard key={session.id} session={session}
                               completed={!!completions[key]} onToggle={() => onToggleCompletion(key)}
-                              draggable={false} onClick={() => onSessionClick({ session, date: day.date })} />
+                              isMoveMode={isMoveMode}
+                              isSelected={false}
+                              onClick={() => !isMoveMode && onSessionClick({ session, date: day.date, weekIdx: week.weekIndex, dayIdx: idx, onMoveStart: null })} />
                           );
                         })}
                       </>
@@ -488,25 +530,42 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                   }
                   return day.sessions.map(session => {
                     const key = `${week.weekIndex}-${idx}-${session.id}`;
-                    const draggable = !['activation', 'warmup', 'strength'].includes(session.type);
+                    const isSelected = moveSelection && moveSelection.sessionId === session.id;
+                    // Movable: runs and strength. Not movable: activation (daily habit) and warmup (tied to its run)
+                    const isMovable = ['easy', 'subT', 'long', 'strength'].includes(session.type);
                     return (
                       <SessionCard key={session.id} session={session}
                         completed={!!completions[key]} onToggle={() => onToggleCompletion(key)}
-                        draggable={draggable}
-                        onDragStart={(e, s) => handleDragStart(e, s, idx)}
-                        onClick={() => onSessionClick({ session, date: day.date })} />
+                        isMoveMode={isMoveMode}
+                        isSelected={isSelected}
+                        onClick={() => onSessionClick({
+                          session,
+                          date: day.date,
+                          weekIdx: week.weekIndex,
+                          dayIdx: idx,
+                          onMoveStart: isMovable ? () => handleSelectForMove(idx, session.id) : null,
+                        })} />
                     );
                   });
                 })()}
               </div>
+              {/* Make empty days a clear drop target when moving */}
+              {isMoveTarget && day.sessions.length === 0 && (
+                <p className="text-xs text-emerald-700 italic text-center py-2">Drop here</p>
+              )}
             </div>
           );
         })}
       </div>
 
-      <p className="mt-3 text-xs text-slate-400 flex items-center gap-1.5">
-        <Info className="h-3 w-3" /> Tap any session for details & export. Drag runs between days to rearrange.
-      </p>
+      <div className="mt-3 text-xs text-slate-500 bg-slate-100 rounded-lg p-3">
+        <p className="font-semibold mb-1">How to use:</p>
+        <ul className="space-y-0.5 list-disc list-inside text-slate-600">
+          <li>Tap the <Circle className="h-3 w-3 inline" /> circle to mark a session done</li>
+          <li>Tap a session card for details, target paces, and watch export</li>
+          <li>To move a run to a different day: tap it, then tap "Move to another day"</li>
+        </ul>
+      </div>
     </div>
   );
 }
@@ -553,13 +612,19 @@ function ArcView({ plan, completions, onJumpToWeek }) {
   );
 }
 
-function SessionModal({ session, paces, onClose }) {
+function SessionModal({ session, onMoveStart, paces, onClose }) {
   const canExportTCX = session.type === 'subT' && session.structured;
   const canExportRun = ['easy', 'subT', 'long'].includes(session.type);
+  const canMove = !!onMoveStart;
 
   const handleTCX = () => {
     const ok = downloadTCX(session, paces.easy);
     if (!ok) alert('Could not generate workout file for this session.');
+  };
+
+  const handleMove = () => {
+    onMoveStart();
+    onClose();
   };
 
   return (
@@ -585,6 +650,14 @@ function SessionModal({ session, paces, onClose }) {
           )}
 
           <p className="text-sm text-slate-700 mb-4 leading-relaxed">{session.detail}</p>
+
+          {canMove && (
+            <button onClick={handleMove}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-900 rounded-md text-sm font-medium transition mb-3">
+              <GripVertical className="h-4 w-4" />
+              Move to another day
+            </button>
+          )}
 
           {canExportRun && (
             <div className="space-y-2 border-t border-slate-100 pt-4">

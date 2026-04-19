@@ -1512,7 +1512,7 @@ function ForecastCard({ forecast }) {
         </div>
         <div className="flex items-center gap-1.5 text-slate-600">
           <span className="text-slate-400">💧</span>
-          <span>{Math.round(forecast.humidity)}% RH</span>
+          <span>{Math.round(forecast.humidity)}% humidity</span>
         </div>
       </div>
     </div>
@@ -1520,13 +1520,12 @@ function ForecastCard({ forecast }) {
 }
 
 function OutfitCard({ outfit, forecast, onFeedback }) {
-  const { items, effectiveTempF, band, bias } = outfit;
+  const { items, effectiveTempF, band, bias, rainAdjusted } = outfit;
   const sections = [
     { label: 'Top', items: items.top, icon: Shirt },
     { label: 'Bottom', items: items.bottom, icon: null },
     { label: 'Head', items: items.head, icon: null },
     { label: 'Hands', items: items.hands, icon: null },
-    { label: 'Feet', items: items.feet, icon: null },
   ].filter(s => s.items.length > 0);
 
   return (
@@ -1541,6 +1540,9 @@ function OutfitCard({ outfit, forecast, onFeedback }) {
           {bias !== 0 && <span className={bias < 0 ? 'text-blue-600' : 'text-orange-600'}> ({bias > 0 ? '+' : ''}{bias} bias)</span>}
         </p>
       </div>
+      <p className="text-[10px] text-slate-400 mb-3 italic leading-snug">
+        Based on the "dress for 10–20°F warmer" principle — your body heats up once you start running{rainAdjusted ? ', and wet clothing cools you further, so the effective temperature is shifted 7°F cooler for rain' : ''}.
+      </p>
 
       <div className="space-y-2 mb-4">
         {sections.map(s => (

@@ -3,12 +3,14 @@ import {
   Calendar, Settings, CheckCircle2, Circle, ChevronLeft, ChevronRight,
   Activity, Dumbbell, Footprints, TrendingUp, RotateCcw, AlertCircle,
   GripVertical, Sunrise, Zap, Download, Watch, Share2, Info, Copy,
+  Cloud, MapPin, Wind, Droplets, Shirt, ThermometerSun, ThermometerSnowflake,
 } from 'lucide-react';
 
 import { storage } from './storage.js';
 import { DAYS, paceFromSeconds, computePaces, computeHRzones, generatePlan } from './planLogic.js';
 import { downloadICS } from './icsExport.js';
 import { downloadTCX } from './tcxExport.js';
+import { geocodeZip, fetchForecast, pickHour, describeWeather, compassFromDeg, recommendOutfit, applyFeedback, getBandForTemp, EMPTY_BIASES } from './weather.js';
 
 const SESSION_COLORS = {
   activation: { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-900', icon: Sunrise },
@@ -55,7 +57,10 @@ export default function App() {
   const [logs, setLogs] = useState({}); // key -> { distMi, timeSec, avgHR, notes }
   const [view, setView] = useState('setup');
   const [loading, setLoading] = useState(true);
-  const [selectedSession, setSelectedSession] = useState(null); // for detail/export modal
+  const [selectedSession, setSelectedSession] = useState(null);
+  // Weather state
+  const [weatherLocation, setWeatherLocation] = useState(null); // { zip, lat, lon, city, state }
+  const [outfitBiases, setOutfitBiases] = useState(EMPTY_BIASES);
 
   useEffect(() => {
     const load = async () => {
@@ -68,7 +73,6 @@ export default function App() {
         if (p) {
           setPlan(JSON.parse(p.value));
           setView('week');
-          // Jump to current week if plan has dates
           const parsed = JSON.parse(p.value);
           const today = todayISO();
           const currentIdx = parsed.findIndex(w =>
@@ -86,6 +90,14 @@ export default function App() {
         const l = await storage.get('logs');
         if (l) setLogs(JSON.parse(l.value));
       } catch {}
+      try {
+        const wl = await storage.get('weatherLocation');
+        if (wl) setWeatherLocation(JSON.parse(wl.value));
+      } catch {}
+      try {
+        const ob = await storage.get('outfitBiases');
+        if (ob) setOutfitBiases({ ...EMPTY_BIASES, ...JSON.parse(ob.value) });
+      } catch {}
       setLoading(false);
     };
     load();
@@ -95,6 +107,24 @@ export default function App() {
   const saveSetup = useCallback(async (s) => { await storage.set('setup', JSON.stringify(s)); }, []);
   const saveCompletions = useCallback(async (c) => { await storage.set('completions', JSON.stringify(c)); }, []);
   const saveLogs = useCallback(async (l) => { await storage.set('logs', JSON.stringify(l)); }, []);
+  const saveWeatherLocation = useCallback(async (wl) => { await storage.set('weatherLocation', JSON.stringify(wl)); }, []);
+  const saveOutfitBiases = useCallback(async (ob) => { await storage.set('outfitBiases', JSON.stringify(ob)); }, []);
+
+  const updateWeatherLocation = (loc) => {
+    setWeatherLocation(loc);
+    saveWeatherLocation(loc);
+  };
+
+  const handleOutfitFeedback = (band, feedback) => {
+    const updated = applyFeedback(outfitBiases, band, feedback);
+    setOutfitBiases(updated);
+    saveOutfitBiases(updated);
+  };
+
+  const resetOutfitBiases = () => {
+    setOutfitBiases(EMPTY_BIASES);
+    saveOutfitBiases(EMPTY_BIASES);
+  };
 
   const handleGenerate = () => {
     const fiveKseconds = setup.fiveKminutes * 60 + setup.fiveKseconds;
@@ -267,12 +297,14 @@ export default function App() {
 
   const handleBackup = () => {
     const backup = {
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       setup,
       plan,
       completions,
       logs,
+      weatherLocation,
+      outfitBiases,
     };
     const content = JSON.stringify(backup, null, 2);
     const blob = new Blob([content], { type: 'application/json' });
@@ -296,13 +328,21 @@ export default function App() {
           alert('That file does not look like a Singles Planner backup.');
           return;
         }
-        if (plan && !confirm('Restore from backup? This will REPLACE your current plan, completion history, and run logs.')) {
+        if (plan && !confirm('Restore from backup? This will REPLACE your current plan, completion history, run logs, and weather settings.')) {
           return;
         }
         setSetup(data.setup);
         setPlan(data.plan);
         setCompletions(data.completions || {});
         setLogs(data.logs || {});
+        if (data.weatherLocation) {
+          setWeatherLocation(data.weatherLocation);
+          saveWeatherLocation(data.weatherLocation);
+        }
+        if (data.outfitBiases) {
+          setOutfitBiases({ ...EMPTY_BIASES, ...data.outfitBiases });
+          saveOutfitBiases(data.outfitBiases);
+        }
         saveSetup(data.setup);
         savePlan(data.plan);
         saveCompletions(data.completions || {});
@@ -379,8 +419,17 @@ export default function App() {
             onJumpToWeek={(i) => { setCurrentWeekIdx(i); setView('week'); }}
           />
         )}
+        {view === 'weather' && (
+          <WeatherView
+            location={weatherLocation}
+            onLocationChange={updateWeatherLocation}
+            biases={outfitBiases}
+            onFeedback={handleOutfitFeedback}
+            onResetBiases={resetOutfitBiases}
+          />
+        )}
 
-        {plan && view !== 'setup' && (
+        {plan && (view === 'week' || view === 'arc') && (
           <div className="mt-6 pt-4 border-t border-slate-200">
             <ZonesLegend paces={paces} hr={hrZones} />
           </div>
@@ -388,10 +437,11 @@ export default function App() {
       </main>
 
       {/* Bottom nav */}
-      {plan && (
+      {(plan || view === 'weather') && (
         <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex items-center justify-around py-2 z-10">
-          <NavButton icon={Calendar} label="Week" active={view === 'week'} onClick={() => setView('week')} />
-          <NavButton icon={TrendingUp} label="Full Arc" active={view === 'arc'} onClick={() => setView('arc')} />
+          {plan && <NavButton icon={Calendar} label="Week" active={view === 'week'} onClick={() => setView('week')} />}
+          {plan && <NavButton icon={TrendingUp} label="Arc" active={view === 'arc'} onClick={() => setView('arc')} />}
+          <NavButton icon={Cloud} label="Weather" active={view === 'weather'} onClick={() => setView('weather')} />
           <NavButton icon={Settings} label="Setup" active={view === 'setup'} onClick={() => setView('setup')} />
         </nav>
       )}
@@ -1237,6 +1287,310 @@ function ZonesLegend({ paces, hr }) {
           <AlertCircle className="h-3.5 w-3.5 text-amber-600 flex-shrink-0 mt-0.5" />
           <p className="text-slate-600 leading-snug">If sub-T HR drifts over {hr.subTHigh}, slow down.</p>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Weather view
+// ============================================================
+
+function todayDateInput() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+function maxForecastDate() {
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  return d.toISOString().slice(0, 10);
+}
+
+function WeatherView({ location, onLocationChange, biases, onFeedback, onResetBiases }) {
+  const [zipInput, setZipInput] = useState(location?.zip || '');
+  const [date, setDate] = useState(todayDateInput());
+  const [hour, setHour] = useState(7); // 0-23
+  const [forecast, setForecast] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Auto-load forecast whenever location/date/hour changes
+  useEffect(() => {
+    const run = async () => {
+      if (!location) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const hours = await fetchForecast(location.lat, location.lon, date);
+        const picked = pickHour(hours, hour);
+        setForecast(picked);
+      } catch (e) {
+        setError(e.message);
+        setForecast(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+    run();
+  }, [location, date, hour]);
+
+  const handleSetZip = async () => {
+    setError(null);
+    try {
+      const loc = await geocodeZip(zipInput);
+      onLocationChange(loc);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const outfit = forecast ? recommendOutfit(forecast, { biases }) : null;
+
+  return (
+    <div className="space-y-3">
+      <h2 className="text-lg font-semibold flex items-center gap-2">
+        <Cloud className="h-5 w-5 text-blue-500" />
+        Weather & outfit
+      </h2>
+
+      {/* Location section */}
+      <div className="bg-white rounded-lg border border-slate-200 p-3">
+        <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">
+          <MapPin className="h-3 w-3 inline mr-1" />
+          ZIP code
+        </label>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={zipInput}
+            onChange={(e) => setZipInput(e.target.value.replace(/\D/g, '').slice(0, 5))}
+            placeholder="10001"
+            className="flex-1 px-3 py-2 border border-slate-200 rounded-md text-sm"
+          />
+          <button onClick={handleSetZip}
+            className="px-4 py-2 bg-slate-900 text-white rounded-md text-sm font-medium hover:bg-slate-800">
+            Set
+          </button>
+        </div>
+        {location && (
+          <p className="text-xs text-slate-500 mt-2">
+            Showing forecast for <span className="font-medium text-slate-700">{location.city}, {location.state} {location.zip}</span>
+          </p>
+        )}
+      </div>
+
+      {/* Date and time picker */}
+      {location && (
+        <div className="bg-white rounded-lg border border-slate-200 p-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">
+                Date
+              </label>
+              <input
+                type="date"
+                value={date}
+                min={todayDateInput()}
+                max={maxForecastDate()}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full px-2 py-1.5 border border-slate-200 rounded-md text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">
+                Time of run
+              </label>
+              <select value={hour} onChange={(e) => setHour(parseInt(e.target.value, 10))}
+                className="w-full px-2 py-1.5 border border-slate-200 rounded-md text-sm bg-white">
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {h === 0 ? '12 AM' : h < 12 ? `${h} AM` : h === 12 ? '12 PM' : `${h - 12} PM`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Loading / error */}
+      {loading && (
+        <div className="bg-white rounded-lg border border-slate-200 p-4 text-center text-sm text-slate-500">
+          Loading forecast...
+        </div>
+      )}
+      {error && (
+        <div className="bg-rose-50 border border-rose-200 rounded-lg p-3 text-sm text-rose-900 flex items-start gap-2">
+          <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+          {error}
+        </div>
+      )}
+
+      {/* Forecast + outfit */}
+      {forecast && outfit && !loading && (
+        <>
+          <ForecastCard forecast={forecast} />
+          <OutfitCard outfit={outfit} forecast={forecast} onFeedback={onFeedback} />
+        </>
+      )}
+
+      {/* Biases display */}
+      {(biases.cold || biases.cool || biases.warm || biases.hot) ? (
+        <div className="bg-white rounded-lg border border-slate-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs font-semibold text-slate-600 uppercase tracking-wider">Your warmth biases</p>
+            <button onClick={onResetBiases} className="text-xs text-slate-500 underline hover:text-slate-700">
+              Reset all
+            </button>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+            {['cold', 'cool', 'warm', 'hot'].map(band => (
+              <BiasChip key={band} band={band} value={biases[band] || 0} />
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-400 mt-2 leading-snug">
+            Negative = dressed warmer (you run cold). Positive = dressed cooler (you run hot). Adjusts based on your feedback.
+          </p>
+        </div>
+      ) : null}
+
+      {!location && !loading && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm text-blue-900">
+          Enter a 5-digit US ZIP code to see weather and outfit recommendations.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BiasChip({ band, value }) {
+  const labels = { cold: '<40°F', cool: '40–60°F', warm: '60–75°F', hot: '>75°F' };
+  const isCold = value < 0;
+  const isHot = value > 0;
+  return (
+    <div className={`rounded-md p-2 border ${
+      isCold ? 'bg-blue-50 border-blue-200' :
+      isHot ? 'bg-orange-50 border-orange-200' :
+      'bg-slate-50 border-slate-200'
+    }`}>
+      <p className="text-[9px] uppercase font-semibold text-slate-500">{band}</p>
+      <p className="text-[10px] text-slate-500">{labels[band]}</p>
+      <p className={`text-sm font-bold tabular-nums ${
+        isCold ? 'text-blue-900' : isHot ? 'text-orange-900' : 'text-slate-400'
+      }`}>
+        {value > 0 ? '+' : ''}{value}°F
+      </p>
+    </div>
+  );
+}
+
+function ForecastCard({ forecast }) {
+  const w = describeWeather(forecast.weatherCode);
+  return (
+    <div className="bg-white rounded-lg border border-slate-200 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <p className="text-3xl font-bold tabular-nums">{Math.round(forecast.tempF)}°F</p>
+          <p className="text-sm text-slate-500">Feels like {Math.round(forecast.feelsLikeF)}°F</p>
+        </div>
+        <div className="text-right">
+          <p className="text-3xl">{w.icon}</p>
+          <p className="text-xs text-slate-500">{w.desc}</p>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-xs pt-3 border-t border-slate-100">
+        <div className="flex items-center gap-1.5 text-slate-600">
+          <Wind className="h-3.5 w-3.5 text-slate-400" />
+          <span>{Math.round(forecast.windMph)} mph {compassFromDeg(forecast.windDeg)}</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-slate-600">
+          <Droplets className="h-3.5 w-3.5 text-slate-400" />
+          <span>{Math.round(forecast.precipPct)}% rain</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-slate-600">
+          <span className="text-slate-400">💧</span>
+          <span>{Math.round(forecast.humidity)}% RH</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OutfitCard({ outfit, forecast, onFeedback }) {
+  const { items, effectiveTempF, band, bias } = outfit;
+  const sections = [
+    { label: 'Top', items: items.top, icon: Shirt },
+    { label: 'Bottom', items: items.bottom, icon: null },
+    { label: 'Head', items: items.head, icon: null },
+    { label: 'Hands', items: items.hands, icon: null },
+    { label: 'Feet', items: items.feet, icon: null },
+  ].filter(s => s.items.length > 0);
+
+  return (
+    <div className="bg-white rounded-lg border border-slate-200 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold text-sm flex items-center gap-2">
+          <Shirt className="h-4 w-4 text-purple-500" />
+          What to wear
+        </h3>
+        <p className="text-[10px] text-slate-500">
+          Dressed for {effectiveTempF}°F
+          {bias !== 0 && <span className={bias < 0 ? 'text-blue-600' : 'text-orange-600'}> ({bias > 0 ? '+' : ''}{bias} bias)</span>}
+        </p>
+      </div>
+
+      <div className="space-y-2 mb-4">
+        {sections.map(s => (
+          <div key={s.label} className="flex items-start gap-3 text-sm">
+            <p className="text-xs font-semibold text-slate-500 uppercase w-14 flex-shrink-0 pt-0.5">{s.label}</p>
+            <div className="flex-1 text-slate-800">
+              {s.items.map((item, i) => <p key={i}>{item}</p>)}
+            </div>
+          </div>
+        ))}
+        {items.extras.length > 0 && (
+          <div className="pt-3 mt-3 border-t border-slate-100 space-y-1.5">
+            {items.extras.map((extra, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs text-amber-900 bg-amber-50 rounded p-2">
+                <AlertCircle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5 text-amber-600" />
+                <span>{extra}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Feedback buttons */}
+      <div className="border-t border-slate-100 pt-3">
+        <p className="text-xs text-slate-500 mb-2">After your run, how was this dressing recommendation?</p>
+        <div className="grid grid-cols-2 gap-2">
+          <button onClick={() => onFeedback(band, 'way-too-cold')}
+            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded-md text-xs font-medium transition">
+            <ThermometerSnowflake className="h-3.5 w-3.5" />
+            Way too cold
+          </button>
+          <button onClick={() => onFeedback(band, 'way-too-hot')}
+            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-100 hover:bg-orange-200 text-orange-900 rounded-md text-xs font-medium transition">
+            <ThermometerSun className="h-3.5 w-3.5" />
+            Way too hot
+          </button>
+          <button onClick={() => onFeedback(band, 'too-cold')}
+            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-md text-xs font-medium transition">
+            <ThermometerSnowflake className="h-3.5 w-3.5" />
+            A bit cold
+          </button>
+          <button onClick={() => onFeedback(band, 'too-hot')}
+            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-50 hover:bg-orange-100 text-orange-800 rounded-md text-xs font-medium transition">
+            <ThermometerSun className="h-3.5 w-3.5" />
+            A bit hot
+          </button>
+        </div>
+        <p className="text-[10px] text-slate-400 mt-2 italic leading-snug">
+          Feedback adjusts the {band} band only ({band === 'cold' ? '<40°F' : band === 'cool' ? '40–60°F' : band === 'warm' ? '60–75°F' : '>75°F'}). Your other bands are unchanged.
+        </p>
       </div>
     </div>
   );

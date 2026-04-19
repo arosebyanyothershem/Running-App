@@ -52,6 +52,7 @@ export default function App() {
   const [plan, setPlan] = useState(null);
   const [currentWeekIdx, setCurrentWeekIdx] = useState(0);
   const [completions, setCompletions] = useState({});
+  const [logs, setLogs] = useState({}); // key -> { distMi, timeSec, avgHR, notes }
   const [view, setView] = useState('setup');
   const [loading, setLoading] = useState(true);
   const [selectedSession, setSelectedSession] = useState(null); // for detail/export modal
@@ -81,6 +82,10 @@ export default function App() {
         const c = await storage.get('completions');
         if (c) setCompletions(JSON.parse(c.value));
       } catch {}
+      try {
+        const l = await storage.get('logs');
+        if (l) setLogs(JSON.parse(l.value));
+      } catch {}
       setLoading(false);
     };
     load();
@@ -89,6 +94,7 @@ export default function App() {
   const savePlan = useCallback(async (p) => { await storage.set('plan', JSON.stringify(p)); }, []);
   const saveSetup = useCallback(async (s) => { await storage.set('setup', JSON.stringify(s)); }, []);
   const saveCompletions = useCallback(async (c) => { await storage.set('completions', JSON.stringify(c)); }, []);
+  const saveLogs = useCallback(async (l) => { await storage.set('logs', JSON.stringify(l)); }, []);
 
   const handleGenerate = () => {
     const fiveKseconds = setup.fiveKminutes * 60 + setup.fiveKseconds;
@@ -111,9 +117,11 @@ export default function App() {
       setPlan(newPlan);
       setCurrentWeekIdx(0);
       setCompletions({});
+      setLogs({});
       savePlan(newPlan);
       saveSetup(setup);
       saveCompletions({});
+      saveLogs({});
       setView('week');
       return;
     }
@@ -128,7 +136,7 @@ export default function App() {
 
     if (pastWeekCount === 0) {
       // No weeks have passed yet — confirm full regeneration
-      if (!confirm('Regenerate the entire plan? Your current completion history will be cleared.')) return;
+      if (!confirm('Regenerate the entire plan? Your current completion history and run logs will be cleared.')) return;
       const newPlan = generatePlan({
         weeks: setup.weeks,
         daysPerWeek: setup.daysPerWeek,
@@ -143,9 +151,11 @@ export default function App() {
       setPlan(newPlan);
       setCurrentWeekIdx(0);
       setCompletions({});
+      setLogs({});
       savePlan(newPlan);
       saveSetup(setup);
       saveCompletions({});
+      saveLogs({});
       setView('week');
       return;
     }
@@ -196,12 +206,18 @@ export default function App() {
     Object.keys(completions).forEach(k => {
       if (validKeys.has(k)) filteredCompletions[k] = completions[k];
     });
+    const filteredLogs = {};
+    Object.keys(logs).forEach(k => {
+      if (validKeys.has(k)) filteredLogs[k] = logs[k];
+    });
 
     setPlan(mergedPlan);
     setCompletions(filteredCompletions);
+    setLogs(filteredLogs);
     savePlan(mergedPlan);
     saveSetup(setup);
     saveCompletions(filteredCompletions);
+    saveLogs(filteredLogs);
     // Jump to the first regenerated week so user sees the change
     setCurrentWeekIdx(pastWeekCount);
     setView('week');
@@ -211,8 +227,10 @@ export default function App() {
     if (!confirm('Reset plan and clear all completion history?')) return;
     setPlan(null);
     setCompletions({});
+    setLogs({});
     await storage.delete('plan');
     await storage.delete('completions');
+    await storage.delete('logs');
     setView('setup');
   };
 
@@ -220,6 +238,17 @@ export default function App() {
     const updated = { ...completions, [key]: !completions[key] };
     setCompletions(updated);
     saveCompletions(updated);
+  };
+
+  const updateLog = (key, log) => {
+    const updated = { ...logs };
+    if (log === null || log === undefined) {
+      delete updated[key];
+    } else {
+      updated[key] = log;
+    }
+    setLogs(updated);
+    saveLogs(updated);
   };
 
   const moveSession = (weekIdx, fromDay, toDay, sessionId) => {
@@ -238,11 +267,12 @@ export default function App() {
 
   const handleBackup = () => {
     const backup = {
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       setup,
       plan,
       completions,
+      logs,
     };
     const content = JSON.stringify(backup, null, 2);
     const blob = new Blob([content], { type: 'application/json' });
@@ -266,15 +296,17 @@ export default function App() {
           alert('That file does not look like a Singles Planner backup.');
           return;
         }
-        if (plan && !confirm('Restore from backup? This will REPLACE your current plan and completion history.')) {
+        if (plan && !confirm('Restore from backup? This will REPLACE your current plan, completion history, and run logs.')) {
           return;
         }
         setSetup(data.setup);
         setPlan(data.plan);
         setCompletions(data.completions || {});
+        setLogs(data.logs || {});
         saveSetup(data.setup);
         savePlan(data.plan);
         saveCompletions(data.completions || {});
+        saveLogs(data.logs || {});
         setCurrentWeekIdx(0);
         setView('week');
         alert('Backup restored.');
@@ -334,6 +366,7 @@ export default function App() {
             currentWeekIdx={currentWeekIdx}
             setCurrentWeekIdx={setCurrentWeekIdx}
             completions={completions}
+            logs={logs}
             onToggleCompletion={toggleCompletion}
             onMoveSession={moveSession}
             onSessionClick={setSelectedSession}
@@ -368,7 +401,11 @@ export default function App() {
         <SessionModal
           session={selectedSession.session}
           onMoveStart={selectedSession.onMoveStart}
+          sessionKey={selectedSession.sessionKey}
+          log={logs[selectedSession.sessionKey]}
+          onSaveLog={(log) => updateLog(selectedSession.sessionKey, log)}
           paces={paces}
+          hr={hrZones}
           onClose={() => setSelectedSession(null)}
         />
       )}
@@ -541,7 +578,7 @@ function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, 
   );
 }
 
-function SessionCard({ session, completed, onToggle, isMoveMode, isSelected, isMovableInMode, onSelectAsMoveTarget, onClick }) {
+function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelected, isMovableInMode, onSelectAsMoveTarget, onClick }) {
   const style = SESSION_COLORS[session.type] || SESSION_COLORS.easy;
   const Icon = style.icon;
 
@@ -577,6 +614,9 @@ function SessionCard({ session, completed, onToggle, isMoveMode, isSelected, isM
             <p className={`text-xs font-semibold ${style.text} leading-tight truncate ${completed ? 'line-through' : ''}`}>
               {session.title}
             </p>
+            {hasLog && (
+              <span className="ml-auto text-[9px] font-bold text-emerald-700 bg-emerald-100 rounded px-1 py-0.5 flex-shrink-0">LOGGED</span>
+            )}
           </div>
           {session.pace && (
             <p className="text-[10px] text-slate-600 leading-tight">{session.pace} · {session.hr}</p>
@@ -587,7 +627,7 @@ function SessionCard({ session, completed, onToggle, isMoveMode, isSelected, isM
   );
 }
 
-function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onToggleCompletion, onMoveSession, onSessionClick }) {
+function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick }) {
   // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
   const [moveSelection, setMoveSelection] = useState(null);
   const week = plan[currentWeekIdx];
@@ -701,9 +741,10 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                           return (
                             <SessionCard key={session.id} session={session}
                               completed={!!completions[key]} onToggle={() => onToggleCompletion(key)}
+                              hasLog={!!logs[key]}
                               isMoveMode={isMoveMode}
                               isSelected={false}
-                              onClick={() => !isMoveMode && onSessionClick({ session, date: day.date, weekIdx: week.weekIndex, dayIdx: idx, onMoveStart: null })} />
+                              onClick={() => !isMoveMode && onSessionClick({ session, date: day.date, weekIdx: week.weekIndex, dayIdx: idx, sessionKey: key, onMoveStart: null })} />
                           );
                         })}
                       </>
@@ -717,6 +758,7 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                     return (
                       <SessionCard key={session.id} session={session}
                         completed={!!completions[key]} onToggle={() => onToggleCompletion(key)}
+                        hasLog={!!logs[key]}
                         isMoveMode={isMoveMode}
                         isSelected={isSelected}
                         onClick={() => onSessionClick({
@@ -724,6 +766,7 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, onTogg
                           date: day.date,
                           weekIdx: week.weekIndex,
                           dayIdx: idx,
+                          sessionKey: key,
                           onMoveStart: isMovable ? () => handleSelectForMove(idx, session.id) : null,
                         })} />
                     );
@@ -804,11 +847,116 @@ function buildSummaryText(session) {
   return lines.join('\n');
 }
 
-function SessionModal({ session, onMoveStart, paces, onClose }) {
+// Parse "mm:ss" or "h:mm:ss" or just minutes as decimal into seconds
+function parseTimeInput(str) {
+  if (!str) return null;
+  const trimmed = String(str).trim();
+  if (!trimmed) return null;
+  if (trimmed.includes(':')) {
+    const parts = trimmed.split(':').map(p => parseInt(p, 10));
+    if (parts.some(p => isNaN(p))) return null;
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return null;
+  }
+  const num = parseFloat(trimmed);
+  if (isNaN(num)) return null;
+  return Math.round(num * 60); // assume decimal minutes
+}
+
+// Calculate pace in seconds per mile from total seconds and miles
+function calcPaceSecPerMile(totalSec, miles) {
+  if (!totalSec || !miles || miles <= 0) return null;
+  return totalSec / miles;
+}
+
+// Compute deterministic feedback for a logged run vs its plan
+function computeFeedback(session, log, paces, hr) {
+  if (!log || !log.distMi || !log.timeSec) return [];
+  const messages = [];
+  const actualPace = calcPaceSecPerMile(log.timeSec, log.distMi);
+
+  if (session.type === 'easy' || session.type === 'long') {
+    // Check easy-day HR
+    if (log.avgHR && hr.easyMax) {
+      const drift = log.avgHR - hr.easyMax;
+      if (drift > 8) {
+        messages.push({
+          tone: 'warning',
+          text: `HR was ${drift} bpm above easy ceiling (${hr.easyMax}). This was a moderate effort, not easy. Slow down next time — the recovery isn't there.`,
+        });
+      } else if (drift > 3) {
+        messages.push({
+          tone: 'caution',
+          text: `HR was ${drift} bpm above target (${hr.easyMax}). Slightly too fast — try dropping pace 10–15 sec/mi.`,
+        });
+      } else if (log.avgHR <= hr.easyMax) {
+        messages.push({
+          tone: 'good',
+          text: `HR stayed in the easy zone (avg ${log.avgHR}, target <${hr.easyMax}). This is exactly right.`,
+        });
+      }
+    }
+    // Distance vs plan
+    if (session.miles && log.distMi) {
+      const diff = log.distMi - session.miles;
+      if (Math.abs(diff) > 1) {
+        messages.push({
+          tone: 'info',
+          text: `Distance was ${diff > 0 ? '+' : ''}${diff.toFixed(1)} mi vs plan (${session.miles} mi).`,
+        });
+      }
+    }
+  }
+
+  if (session.type === 'subT') {
+    // Check sub-T HR window
+    if (log.avgHR && hr.subTHigh) {
+      if (log.avgHR > hr.subTHigh + 3) {
+        messages.push({
+          tone: 'warning',
+          text: `HR was ${log.avgHR - hr.subTHigh} bpm above sub-T ceiling (${hr.subTHigh}). Too hard — repeatability matters more than intensity. Drop pace 10–15 sec/mi next time.`,
+        });
+      } else if (log.avgHR < hr.subTLow - 5) {
+        messages.push({
+          tone: 'caution',
+          text: `HR was below sub-T zone (avg ${log.avgHR}, target ${hr.subTLow}+). Was the effort firm enough? Sub-T should feel "comfortably hard".`,
+        });
+      } else {
+        messages.push({
+          tone: 'good',
+          text: `HR landed in the sub-T zone (avg ${log.avgHR}). Well-executed.`,
+        });
+      }
+    }
+    // Pace vs target
+    if (actualPace && paces.subT.high) {
+      if (actualPace < paces.subT.low - 10) {
+        messages.push({
+          tone: 'warning',
+          text: `Pace was faster than sub-T target. Easy to do, hard to recover from. Hold yourself back next session.`,
+        });
+      }
+    }
+  }
+
+  // Notes always shown verbatim if present (no feedback computed)
+  return messages;
+}
+
+function SessionModal({ session, onMoveStart, sessionKey, log, onSaveLog, paces, hr, onClose }) {
   const canExportTCX = session.type === 'subT' && session.structured;
   const canExportRun = ['easy', 'subT', 'long'].includes(session.type);
   const canMove = !!onMoveStart;
+  const canLog = canExportRun; // only runs are loggable
   const [copied, setCopied] = useState(false);
+  const [showLogForm, setShowLogForm] = useState(false);
+
+  // Form state
+  const [distInput, setDistInput] = useState(log?.distMi ?? '');
+  const [timeInput, setTimeInput] = useState(log?.timeSec ? secondsToMMSS(log.timeSec) : '');
+  const [hrInput, setHrInput] = useState(log?.avgHR ?? '');
+  const [notesInput, setNotesInput] = useState(log?.notes ?? '');
 
   const handleTCX = () => {
     const ok = downloadTCX(session, paces.easy);
@@ -826,7 +974,6 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(text);
       } else {
-        // Fallback for older browsers / non-secure contexts
         const ta = document.createElement('textarea');
         ta.value = text;
         ta.style.position = 'fixed';
@@ -843,9 +990,40 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
     }
   };
 
+  const handleSaveLog = () => {
+    const dist = parseFloat(distInput);
+    const timeSec = parseTimeInput(timeInput);
+    const avgHR = hrInput ? parseInt(hrInput, 10) : null;
+    if (!dist || !timeSec) {
+      alert('Please enter at least distance and time.');
+      return;
+    }
+    onSaveLog({
+      distMi: dist,
+      timeSec,
+      avgHR: avgHR && !isNaN(avgHR) ? avgHR : null,
+      notes: notesInput?.trim() || '',
+      loggedAt: new Date().toISOString(),
+    });
+    setShowLogForm(false);
+  };
+
+  const handleDeleteLog = () => {
+    if (!confirm('Delete this run log?')) return;
+    onSaveLog(null);
+    setDistInput('');
+    setTimeInput('');
+    setHrInput('');
+    setNotesInput('');
+    setShowLogForm(false);
+  };
+
+  const feedback = log ? computeFeedback(session, log, paces, hr) : [];
+  const actualPaceSec = log ? calcPaceSecPerMile(log.timeSec, log.distMi) : null;
+
   return (
     <div className="fixed inset-0 bg-slate-900/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
-      <div className="bg-white rounded-t-2xl sm:rounded-xl max-w-lg w-full max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+      <div className="bg-white rounded-t-2xl sm:rounded-xl max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="p-5">
           <div className="flex items-start justify-between gap-3 mb-3">
             <h3 className="font-semibold text-lg">{session.title}</h3>
@@ -867,7 +1045,137 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
 
           <p className="text-sm text-slate-700 mb-4 leading-relaxed">{session.detail}</p>
 
-          {canMove && (
+          {/* Logged run summary */}
+          {log && !showLogForm && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 mb-3">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-bold text-emerald-900 uppercase tracking-wider">Logged</p>
+                <button onClick={() => setShowLogForm(true)} className="text-xs text-emerald-700 underline">Edit</button>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-xs mb-2">
+                <div>
+                  <p className="text-emerald-700 text-[10px] uppercase">Distance</p>
+                  <p className="font-semibold text-slate-900">{log.distMi.toFixed(2)} mi</p>
+                </div>
+                <div>
+                  <p className="text-emerald-700 text-[10px] uppercase">Time</p>
+                  <p className="font-semibold text-slate-900">{secondsToMMSS(log.timeSec)}</p>
+                </div>
+                <div>
+                  <p className="text-emerald-700 text-[10px] uppercase">Pace</p>
+                  <p className="font-semibold text-slate-900">{actualPaceSec ? paceFromSeconds(actualPaceSec) : '—'}/mi</p>
+                </div>
+              </div>
+              {log.avgHR && (
+                <div className="text-xs mb-2">
+                  <p className="text-emerald-700 text-[10px] uppercase">Avg HR</p>
+                  <p className="font-semibold text-slate-900">{log.avgHR} bpm</p>
+                </div>
+              )}
+              {log.notes && (
+                <div className="text-xs mt-2 pt-2 border-t border-emerald-200">
+                  <p className="text-emerald-700 text-[10px] uppercase mb-1">Notes</p>
+                  <p className="text-slate-700 italic">"{log.notes}"</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Feedback messages */}
+          {log && !showLogForm && feedback.length > 0 && (
+            <div className="space-y-1.5 mb-3">
+              {feedback.map((f, i) => {
+                const styles = {
+                  good: 'bg-emerald-50 border-emerald-200 text-emerald-900',
+                  warning: 'bg-rose-50 border-rose-200 text-rose-900',
+                  caution: 'bg-amber-50 border-amber-200 text-amber-900',
+                  info: 'bg-slate-50 border-slate-200 text-slate-700',
+                };
+                return (
+                  <div key={i} className={`rounded-md border p-2.5 text-xs leading-snug ${styles[f.tone]}`}>
+                    {f.text}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Log form */}
+          {showLogForm && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 mb-3 space-y-3">
+              <p className="text-xs font-bold text-slate-700 uppercase tracking-wider">Log this run</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1">Distance (mi)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={distInput}
+                    onChange={(e) => setDistInput(e.target.value)}
+                    placeholder={session.miles?.toFixed(1) ?? ''}
+                    className="w-full px-2 py-1.5 border border-slate-200 rounded text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1">Time (mm:ss)</label>
+                  <input
+                    type="text"
+                    value={timeInput}
+                    onChange={(e) => setTimeInput(e.target.value)}
+                    placeholder="42:30"
+                    className="w-full px-2 py-1.5 border border-slate-200 rounded text-sm"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1">Avg HR (optional)</label>
+                <input
+                  type="number"
+                  value={hrInput}
+                  onChange={(e) => setHrInput(e.target.value)}
+                  placeholder="138"
+                  className="w-32 px-2 py-1.5 border border-slate-200 rounded text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 uppercase font-semibold mb-1">Notes (optional)</label>
+                <textarea
+                  value={notesInput}
+                  onChange={(e) => setNotesInput(e.target.value)}
+                  placeholder="Felt good, no ITB pain..."
+                  rows={2}
+                  className="w-full px-2 py-1.5 border border-slate-200 rounded text-sm resize-none"
+                />
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button onClick={handleSaveLog}
+                  className="flex-1 px-3 py-2 bg-slate-900 text-white rounded-md text-sm font-medium hover:bg-slate-800">
+                  Save log
+                </button>
+                <button onClick={() => setShowLogForm(false)}
+                  className="px-3 py-2 bg-white text-slate-700 border border-slate-200 rounded-md text-sm font-medium hover:bg-slate-50">
+                  Cancel
+                </button>
+                {log && (
+                  <button onClick={handleDeleteLog}
+                    className="px-3 py-2 bg-red-50 text-red-700 border border-red-200 rounded-md text-sm font-medium hover:bg-red-100">
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Action buttons */}
+          {canLog && !log && !showLogForm && (
+            <button onClick={() => setShowLogForm(true)}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-sm font-medium transition mb-2">
+              <CheckCircle2 className="h-4 w-4" />
+              Log this run
+            </button>
+          )}
+
+          {canMove && !showLogForm && (
             <button onClick={handleMove}
               className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-900 rounded-md text-sm font-medium transition mb-2">
               <GripVertical className="h-4 w-4" />
@@ -875,7 +1183,7 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
             </button>
           )}
 
-          {canExportRun && (
+          {canExportRun && !showLogForm && (
             <button onClick={handleCopy}
               className={`w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-md text-sm font-medium transition mb-2 ${
                 copied ? 'bg-emerald-100 text-emerald-900' : 'bg-slate-100 hover:bg-slate-200 text-slate-900'
@@ -885,7 +1193,7 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
             </button>
           )}
 
-          {canExportTCX && (
+          {canExportTCX && !showLogForm && (
             <button onClick={handleTCX}
               className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-900 text-white rounded-md text-sm font-medium hover:bg-slate-800 transition">
               <Watch className="h-4 w-4" />
@@ -896,6 +1204,13 @@ function SessionModal({ session, onMoveStart, paces, onClose }) {
       </div>
     </div>
   );
+}
+
+function secondsToMMSS(totalSec) {
+  if (!totalSec || isNaN(totalSec)) return '';
+  const m = Math.floor(totalSec / 60);
+  const s = Math.round(totalSec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 function ZonesLegend({ paces, hr }) {

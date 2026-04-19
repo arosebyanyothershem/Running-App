@@ -35,6 +35,7 @@ export async function fetchForecast(lat, lon, dateISO) {
     'wind_speed_10m',
     'wind_direction_10m',
     'relative_humidity_2m',
+    'cloud_cover',
     'uv_index',
   ].join(','));
   url.searchParams.set('temperature_unit', 'fahrenheit');
@@ -59,6 +60,7 @@ export async function fetchForecast(lat, lon, dateISO) {
     windMph: data.hourly.wind_speed_10m[i],
     windDeg: data.hourly.wind_direction_10m[i],
     humidity: data.hourly.relative_humidity_2m[i],
+    cloudsPct: data.hourly.cloud_cover ? data.hourly.cloud_cover[i] : null,
     uv: data.hourly.uv_index ? data.hourly.uv_index[i] : null,
   }));
 
@@ -111,6 +113,10 @@ export function compassFromDeg(deg) {
 
 // Outfit recommendations with banded warmth biases
 //
+// Calibrated against a 6-source publication consensus (Nike, Peloton, NYRR,
+// Marathon Handbook, RVCA, Runner's World) cross-checked against 15 real-world
+// dressmyrun.com data points and refined with Tina Muir's 5°F-interval guide.
+//
 // `biases` is an object: { cold, cool, warm, hot } where each value is a °F offset
 // applied to the effective temp when the actual feels-like falls in that band:
 //   cold band:  feels-like < 40°F
@@ -120,7 +126,8 @@ export function compassFromDeg(deg) {
 // A NEGATIVE bias means "I run cold, dress me warmer" (effective temp drops)
 // A POSITIVE bias means "I run hot, dress me cooler" (effective temp rises)
 //
-// Returns { items, effectiveTempF, band } so the UI can attribute feedback to the right band.
+// Returns { items, effectiveTempF, band, bias } so the UI can attribute feedback
+// to the right band and explain the effective temperature.
 export function getBandForTemp(feelsLikeF) {
   if (feelsLikeF < 40) return 'cold';
   if (feelsLikeF < 60) return 'cool';
@@ -134,97 +141,129 @@ export function recommendOutfit(weather, options = {}) {
 
   const band = getBandForTemp(weather.feelsLikeF);
   const bias = biases[band] || 0;
-  let effTemp = weather.feelsLikeF + bias;
+
+  // Rain adjustment: per Tina Muir, Andrea Ference, Running Shoes Guru consensus,
+  // wet clothing cools the body significantly. Dress for ~7°F cooler when rain is
+  // likely (midpoint of the publication-agreed 5–10°F range).
+  const precipPct = weather.precipPct || 0;
+  const precipIn = weather.precipIn || 0;
+  const rainAdjustment = precipPct >= 40 ? -7 : 0;
+
+  let effTemp = weather.feelsLikeF + bias + rainAdjustment;
 
   const wind = weather.windMph || 0;
-  const precip = weather.precipPct || 0;
-  const willRain = precip >= 40;
-  const heavyRain = (weather.precipIn || 0) > 0.05;
-  const items = { top: [], bottom: [], head: [], hands: [], feet: [], extras: [] };
+  const uv = weather.uv || 0;
+  const cloudsPct = weather.cloudsPct;
+  const heavyRain = precipIn > 0.05;
+  const willRain = precipPct >= 40;
+  const items = { top: [], bottom: [], head: [], hands: [], extras: [] };
 
   // ============ TOP ============
-  if (effTemp >= 75) {
-    items.top.push('Singlet or technical T-shirt');
-  } else if (effTemp >= 60) {
-    items.top.push('Short-sleeve technical T-shirt');
-  } else if (effTemp >= 50) {
-    items.top.push('Long-sleeve base layer');
+  // Sources: Tina Muir, dressmyrun, publication consensus
+  if (effTemp >= 90) {
+    items.top.push('Tank or singlet (lightweight, moisture-wicking)');
+  } else if (effTemp >= 80) {
+    items.top.push('Tank or singlet (lightweight, moisture-wicking)');
+  } else if (effTemp >= 65) {
+    items.top.push('Technical T-shirt or tank (personal preference)');
+  } else if (effTemp >= 55) {
+    items.top.push('Technical T-shirt');
+  } else if (effTemp >= 45) {
+    items.top.push('Long-sleeve or T-shirt (personal preference)');
   } else if (effTemp >= 40) {
-    items.top.push('Long-sleeve base layer + light long-sleeve over-shirt');
-  } else if (effTemp >= 30) {
-    items.top.push('Long-sleeve base layer + thermal mid-layer');
-  } else if (effTemp >= 20) {
-    items.top.push('Base layer + thermal mid-layer + wind/soft-shell jacket');
-  } else if (effTemp >= 10) {
-    items.top.push('Heavy base layer + thermal mid-layer + insulated jacket');
+    items.top.push('Long-sleeve technical shirt');
+  } else if (effTemp >= 32) {
+    items.top.push('Long-sleeve base layer (add light jacket or vest if windy)');
+  } else if (effTemp >= 25) {
+    items.top.push('Long-sleeve base + thicker mid-layer or wind jacket');
+  } else if (effTemp >= 15) {
+    items.top.push('Long-sleeve base layer + windproof/waterproof jacket');
   } else {
-    items.top.push('Multiple base layers + insulated winter running jacket');
+    items.top.push('Two long-sleeve layers + heavy insulated wind jacket');
   }
 
   // ============ BOTTOM ============
-  if (effTemp >= 60) {
-    items.bottom.push('Shorts');
+  if (effTemp >= 55) {
+    items.bottom.push('Shorts (technical, with built-in liner)');
   } else if (effTemp >= 45) {
-    items.bottom.push('Shorts (legs warm fast) or capri tights');
-  } else if (effTemp >= 30) {
+    items.bottom.push('Shorts (or half-tights if you run cold)');
+  } else if (effTemp >= 40) {
+    items.bottom.push('Half-tights or tights');
+  } else if (effTemp >= 32) {
     items.bottom.push('Running tights');
   } else if (effTemp >= 15) {
     items.bottom.push('Thermal running tights');
   } else {
-    items.bottom.push('Thermal tights + wind-blocking pants');
-  }
-
-  // ============ HEAD ============
-  if (effTemp < 30) {
-    items.head.push('Beanie or thermal headband');
-  } else if (effTemp < 45) {
-    items.head.push('Light headband or beanie covering ears');
-  } else if (effTemp >= 70) {
-    items.head.push('Cap or visor (sun protection)');
+    items.bottom.push('Thermal tights with wind pants layered over');
   }
 
   // ============ HANDS ============
-  if (effTemp < 25) {
-    items.hands.push('Insulated gloves or mittens');
+  if (effTemp < 20) {
+    items.hands.push('Mittens (waterproof for precipitation)');
+  } else if (effTemp < 32) {
+    items.hands.push('Running gloves');
   } else if (effTemp < 40) {
     items.hands.push('Light running gloves');
-  } else if (effTemp < 50) {
+  } else if (effTemp < 45) {
     items.hands.push('Light gloves (optional, for first mile)');
   }
 
-  // ============ FEET ============
-  if (effTemp < 30) {
-    items.feet.push('Thermal/wool socks');
-  } else if (effTemp < 50) {
-    items.feet.push('Mid-weight socks');
-  } else {
-    items.feet.push('Standard running socks');
+  // ============ HEAD ============
+  // Cap rule: UV ≥ 3, OR precip ≥ 20%, OR (cold AND not fully overcast)
+  // Beanie rule: graduated by temperature per Tina Muir
+  const lowClouds = cloudsPct === null || cloudsPct === undefined || cloudsPct < 80;
+  const needsCap = uv >= 3 || precipPct >= 20 || (effTemp <= 40 && lowClouds);
+
+  if (effTemp < 20) {
+    items.head.push('Thick beanie with neck gaiter or buff');
+  } else if (effTemp < 25) {
+    items.head.push('Beanie covering ears');
+  } else if (effTemp < 32) {
+    items.head.push('Fleece headband or light beanie');
+  } else if (effTemp < 40) {
+    items.head.push('Light headband (optional)');
+  }
+  // Cap can coexist with beanie in cold/rainy conditions — they serve different purposes
+  if (needsCap && effTemp >= 25) {
+    const capReason = precipPct >= 20 ? 'keeps rain out of eyes' : 'sun and sweat protection';
+    items.head.push(`Cap or visor (${capReason})`);
   }
 
-  // ============ EXTRAS ============
-  if (wind > 15 && effTemp < 50) {
-    items.extras.push('Wind-blocking outer layer recommended');
+  // ============ ACCESSORIES / EXTRAS ============
+  // Sunglasses: (clear skies OR UV ≥ 3) AND not raining
+  const clearSkies = cloudsPct !== null && cloudsPct !== undefined && cloudsPct < 40;
+  if ((clearSkies || uv >= 3) && precipPct < 20) {
+    items.extras.push('Sunglasses for sun protection');
   }
-  if (wind > 20) {
+
+  // Rain-specific extras
+  if (willRain) {
+    if (heavyRain) {
+      items.extras.push('Water-resistant running jacket (or consider postponing if rain is intense)');
+    } else {
+      items.extras.push('Water-resistant shell recommended — dressed for 7°F cooler to account for wet clothing');
+    }
+  }
+
+  // Wind callout (feels-like already accounts for wind chill, but high winds deserve mention)
+  if (wind >= 20) {
     items.extras.push(`Wind ${Math.round(wind)} mph — run into the wind first, with it on the way back`);
   }
-  if (willRain || heavyRain) {
-    items.extras.push(heavyRain ? 'Water-resistant jacket or skip the run' : 'Light water-resistant shell or cap with brim');
-  }
-  if (effTemp < 30) {
-    items.extras.push('Cover exposed skin — frostbite risk is real below freezing with wind');
-  }
-  if (effTemp >= 80) {
-    items.extras.push('Bring water; consider running earlier or later for cooler temps');
+
+  // Heat warnings
+  if (effTemp >= 85 && effTemp < 90) {
+    items.extras.push('Hydrate well; consider running in the cooler hours of the day');
   }
   if (effTemp >= 90) {
-    items.extras.push('Strongly consider rescheduling — heat illness risk');
-  }
-  if (weather.uv && weather.uv >= 6) {
-    items.extras.push('UV index high — sunscreen + hat');
+    items.extras.push('Heat illness risk — strongly consider rescheduling, running indoors, or choosing early morning / evening');
   }
 
-  return { items, effectiveTempF: Math.round(effTemp), band, bias };
+  // Frostbite warning
+  if (effTemp < 20) {
+    items.extras.push('Cover exposed skin — frostbite risk in sub-freezing conditions with any wind');
+  }
+
+  return { items, effectiveTempF: Math.round(effTemp), band, bias, rainAdjusted: rainAdjustment !== 0 };
 }
 
 // Apply user feedback to update the bias for the relevant temperature band.

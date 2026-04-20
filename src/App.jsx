@@ -765,8 +765,14 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, 
       <div className="grid grid-cols-1 sm:grid-cols-7 gap-2">
         {week.days.map((day, idx) => {
           const today = day.date && isToday(day.date);
-          const d = day.date ? new Date(day.date) : null;
-          const dateDisplay = d ? `${d.getMonth() + 1}/${d.getDate()}` : '';
+          // Parse YYYY-MM-DD as LOCAL date (not UTC) to avoid the off-by-one
+          // bug where "2026-04-20" would parse as UTC midnight and render as
+          // April 19 in Eastern Time.
+          let dateDisplay = '';
+          if (day.date) {
+            const [y, m, d] = day.date.split('-').map(Number);
+            dateDisplay = `${m}/${d}`;
+          }
           const isMoveTarget = isMoveMode && moveSelection.fromDay !== idx;
           const isSourceDay = isMoveMode && moveSelection.fromDay === idx;
 

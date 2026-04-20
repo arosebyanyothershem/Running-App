@@ -21,9 +21,18 @@ const SESSION_COLORS = {
   strength: { bg: 'bg-purple-50', border: 'border-purple-200', text: 'text-purple-900', icon: Dumbbell },
 };
 
+// Format a Date object as YYYY-MM-DD in LOCAL time (not UTC).
+// Critical: `toISOString()` converts to UTC first, which shifts dates by 1 day
+// for users after ~8pm ET.
+function formatLocalISO(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 function todayISO() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
+  return formatLocalISO(new Date());
 }
 
 function nextMondayISO() {
@@ -31,7 +40,7 @@ function nextMondayISO() {
   const js = d.getDay();
   const daysUntilMon = js === 0 ? 1 : (js === 1 ? 0 : 8 - js);
   d.setDate(d.getDate() + daysUntilMon);
-  return d.toISOString().slice(0, 10);
+  return formatLocalISO(d);
 }
 
 function isToday(dateStr) {
@@ -196,9 +205,10 @@ export default function App() {
 
     // Find the start date for the future portion: the day after the last past week ends
     const lastPastWeek = pastWeeks[pastWeeks.length - 1];
-    const lastPastEnd = new Date(lastPastWeek.days[6].date);
+    const [ly, lm, ld] = lastPastWeek.days[6].date.split('-').map(Number);
+    const lastPastEnd = new Date(ly, lm - 1, ld);
     lastPastEnd.setDate(lastPastEnd.getDate() + 1);
-    const futureStartDate = lastPastEnd.toISOString().slice(0, 10);
+    const futureStartDate = formatLocalISO(lastPastEnd);
 
     const futureWeekCount = Math.max(1, setup.weeks - pastWeekCount);
 
@@ -1297,14 +1307,13 @@ function ZonesLegend({ paces, hr }) {
 // ============================================================
 
 function todayDateInput() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
+  return formatLocalISO(new Date());
 }
 
 function maxForecastDate() {
   const d = new Date();
   d.setDate(d.getDate() + 7);
-  return d.toISOString().slice(0, 10);
+  return formatLocalISO(d);
 }
 
 function WeatherView({ location, onLocationChange, biases, onFeedback, onResetBiases }) {

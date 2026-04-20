@@ -86,10 +86,21 @@ export function generatePlan({
   return out;
 }
 
+// IMPORTANT: Parse and format dates as LOCAL dates, not UTC.
+// `new Date("2026-04-20")` parses as UTC midnight, which in Eastern Time is
+// April 19 8pm — and then `toISOString().slice(0,10)` converts back to UTC
+// and returns "2026-04-19". That shifts every displayed date by one day.
+// We avoid the bug by parsing and formatting the YYYY-MM-DD parts directly.
 function addDays(dateStr, days) {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = dateStr.split('-').map(Number);
+  // Construct as local-time date
+  const date = new Date(y, m - 1, d);
+  date.setDate(date.getDate() + days);
+  // Format back as YYYY-MM-DD in local time
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function dateForDay(weekStart, dayIndex) {

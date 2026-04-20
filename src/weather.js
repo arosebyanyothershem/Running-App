@@ -26,9 +26,12 @@ export async function fetchForecast(lat, lon, dateISO) {
   const url = new URL('https://api.open-meteo.com/v1/forecast');
   url.searchParams.set('latitude', lat);
   url.searchParams.set('longitude', lon);
+  // Note: we deliberately do NOT request apparent_temperature from Open-Meteo.
+  // Open-Meteo uses the Australian Steadman formula which overstates wind chill
+  // at low wind speeds. We calculate feels-like ourselves using the US NWS
+  // formulas (see calculateFeelsLike below) to match Apple Weather / iPhone.
   url.searchParams.set('hourly', [
     'temperature_2m',
-    'apparent_temperature',
     'precipitation_probability',
     'precipitation',
     'weather_code',
@@ -49,20 +52,25 @@ export async function fetchForecast(lat, lon, dateISO) {
   if (!res.ok) throw new Error('Could not fetch weather.');
   const data = await res.json();
 
-  // Reshape into per-hour objects
-  const hours = data.hourly.time.map((t, i) => ({
-    time: t,
-    tempF: data.hourly.temperature_2m[i],
-    feelsLikeF: data.hourly.apparent_temperature[i],
-    precipPct: data.hourly.precipitation_probability[i],
-    precipIn: data.hourly.precipitation[i],
-    weatherCode: data.hourly.weather_code[i],
-    windMph: data.hourly.wind_speed_10m[i],
-    windDeg: data.hourly.wind_direction_10m[i],
-    humidity: data.hourly.relative_humidity_2m[i],
-    cloudsPct: data.hourly.cloud_cover ? data.hourly.cloud_cover[i] : null,
-    uv: data.hourly.uv_index ? data.hourly.uv_index[i] : null,
-  }));
+  // Reshape into per-hour objects. feelsLikeF is calculated locally.
+  const hours = data.hourly.time.map((t, i) => {
+    const tempF = data.hourly.temperature_2m[i];
+    const windMph = data.hourly.wind_speed_10m[i];
+    const humidity = data.hourly.relative_humidity_2m[i];
+    return {
+      time: t,
+      tempF,
+      feelsLikeF: Math.round(calculateFeelsLike(tempF, windMph, humidity) * 10) / 10,
+      precipPct: data.hourly.precipitation_probability[i],
+      precipIn: data.hourly.precipitation[i],
+      weatherCode: data.hourly.weather_code[i],
+      windMph,
+      windDeg: data.hourly.wind_direction_10m[i],
+      humidity,
+      cloudsPct: data.hourly.cloud_cover ? data.hourly.cloud_cover[i] : null,
+      uv: data.hourly.uv_index ? data.hourly.uv_index[i] : null,
+    };
+  });
 
   return hours;
 }
@@ -109,6 +117,68 @@ export function describeWeather(code) {
 export function compassFromDeg(deg) {
   const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   return dirs[Math.round(deg / 45) % 8];
+}
+
+// ============================================================
+// Feels-like temperature calculation
+// ============================================================
+// We calculate this ourselves using US NWS formulas instead of using
+// Open-Meteo's `apparent_temperature`. Open-Meteo uses the Australian
+// Steadman formula, which is known to overstate wind chill at low wind
+// speeds (producing e.g. 31°F feels-like at 36°F / 3mph). This is the
+// same issue documented at https://github.com/open-meteo/open-meteo/discussions/651
+//
+// Apple Weather, weather.gov, and most US weather apps use:
+//   - NWS Wind Chill formula for cold temps (T <= 50°F, wind > 3 mph)
+//   - NWS Heat Index (Rothfusz) formula for hot temps (T >= 80°F)
+//   - Actual temperature everywhere else
+//
+// This matches what the user sees on their iPhone and on dressmyrun.com
+// (which uses Apple Weather).
+
+// NWS Wind Chill: Wind Chill (°F) = 35.74 + 0.6215T − 35.75(V^0.16) + 0.4275T(V^0.16)
+// Valid for T <= 50°F AND wind > 3 mph. Otherwise return actual temp.
+function nwsWindChill(tempF, windMph) {
+  if (tempF > 50 || windMph <= 3) return tempF;
+  const v16 = Math.pow(windMph, 0.16);
+  return 35.74 + 0.6215 * tempF - 35.75 * v16 + 0.4275 * tempF * v16;
+}
+
+// NWS Heat Index (Rothfusz regression): valid for T >= 80°F AND RH >= 40%.
+// Uses simplified (Steadman) for lower temps/humidity.
+function nwsHeatIndex(tempF, relativeHumidity) {
+  // Rothfusz regression is only meaningful when hot; use a simplified version
+  // (Steadman's average) for the boundary before returning to actual temp.
+  if (tempF < 80) return tempF;
+  const T = tempF;
+  const RH = relativeHumidity;
+  // Simplified formula first for low-humidity or boundary cases
+  const simple = 0.5 * (T + 61.0 + ((T - 68.0) * 1.2) + (RH * 0.094));
+  if ((simple + T) / 2 < 80) return tempF;
+
+  // Full Rothfusz regression
+  let HI = -42.379 + 2.04901523 * T + 10.14333127 * RH
+    - 0.22475541 * T * RH - 0.00683783 * T * T - 0.05481717 * RH * RH
+    + 0.00122874 * T * T * RH + 0.00085282 * T * RH * RH
+    - 0.00000199 * T * T * RH * RH;
+
+  // Adjustments per NWS
+  if (RH < 13 && T >= 80 && T <= 112) {
+    const adj = ((13 - RH) / 4) * Math.sqrt((17 - Math.abs(T - 95)) / 17);
+    HI -= adj;
+  } else if (RH > 85 && T >= 80 && T <= 87) {
+    const adj = ((RH - 85) / 10) * ((87 - T) / 5);
+    HI += adj;
+  }
+
+  return HI;
+}
+
+// Compute feels-like temp using NWS formulas
+export function calculateFeelsLike(tempF, windMph, relativeHumidity) {
+  if (tempF <= 50) return nwsWindChill(tempF, windMph);
+  if (tempF >= 80) return nwsHeatIndex(tempF, relativeHumidity);
+  return tempF; // 50–80°F: feels-like equals actual temp
 }
 
 // Outfit recommendations with banded warmth biases

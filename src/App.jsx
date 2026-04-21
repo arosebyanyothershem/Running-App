@@ -4,7 +4,7 @@ import {
   Activity, Dumbbell, Footprints, TrendingUp, RotateCcw, AlertCircle,
   GripVertical, Sunrise, Zap, Download, Watch, Share2, Info, Copy,
   Cloud, MapPin, Wind, Droplets, Shirt, ThermometerSun, ThermometerSnowflake,
-  Heart, X, TrendingDown, Minus,
+  Heart, X, TrendingDown, Minus, Plus, Trash2,
 } from 'lucide-react';
 
 import { storage } from './storage.js';
@@ -12,7 +12,7 @@ import { DAYS, paceFromSeconds, computePaces, computeHRzones, generatePlan } fro
 import { downloadICS } from './icsExport.js';
 import { downloadTCX } from './tcxExport.js';
 import { geocodeZip, fetchForecast, pickHour, describeWeather, compassFromDeg, recommendOutfit, applyFeedback, getBandForTemp, EMPTY_BIASES } from './weather.js';
-import { getEntryForDate, hasDailyEntry, getRecentEntries, computeStats, painLogToCSV } from './painTracking.js';
+import { getEntryForDate, hasDailyEntry, getRecentEntries, computeStats, painLogToCSV, DEFAULT_REHAB_CONFIG, getRehabCountForDate, wasExerciseDone, getRehabStreak, getRehabGridData, computeRehabStats } from './painTracking.js';
 
 const SESSION_COLORS = {
   activation: { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-900', icon: Sunrise },
@@ -75,6 +75,9 @@ export default function App() {
   // Pain tracking state: { [dateISO]: { morningPain, deskPain, postRunPain, note } }
   const [painLog, setPainLog] = useState({});
   const [painModal, setPainModal] = useState(null); // null | { date, mode: 'daily' | 'postRun' }
+  // Rehab tracking
+  const [rehabConfig, setRehabConfig] = useState(DEFAULT_REHAB_CONFIG); // { exercises: [...] }
+  const [rehabLog, setRehabLog] = useState({}); // { [dateISO]: { [exerciseId]: true } }
 
   useEffect(() => {
     const load = async () => {
@@ -116,6 +119,14 @@ export default function App() {
         const pl = await storage.get('painLog');
         if (pl) setPainLog(JSON.parse(pl.value));
       } catch {}
+      try {
+        const rc = await storage.get('rehabConfig');
+        if (rc) setRehabConfig(JSON.parse(rc.value));
+      } catch {}
+      try {
+        const rl = await storage.get('rehabLog');
+        if (rl) setRehabLog(JSON.parse(rl.value));
+      } catch {}
       setLoading(false);
     };
     load();
@@ -128,6 +139,31 @@ export default function App() {
   const saveWeatherLocation = useCallback(async (wl) => { await storage.set('weatherLocation', JSON.stringify(wl)); }, []);
   const saveOutfitBiases = useCallback(async (ob) => { await storage.set('outfitBiases', JSON.stringify(ob)); }, []);
   const savePainLog = useCallback(async (pl) => { await storage.set('painLog', JSON.stringify(pl)); }, []);
+  const saveRehabConfig = useCallback(async (rc) => { await storage.set('rehabConfig', JSON.stringify(rc)); }, []);
+  const saveRehabLog = useCallback(async (rl) => { await storage.set('rehabLog', JSON.stringify(rl)); }, []);
+
+  const toggleRehabExercise = useCallback((dateISO, exerciseId) => {
+    setRehabLog(prev => {
+      const existing = prev[dateISO] || {};
+      const next = {
+        ...prev,
+        [dateISO]: { ...existing, [exerciseId]: !existing[exerciseId] },
+      };
+      // Clean up: if all flags are false, remove the date entry to keep the log tidy
+      const allFalse = Object.values(next[dateISO]).every(v => !v);
+      if (allFalse) delete next[dateISO];
+      saveRehabLog(next);
+      return next;
+    });
+  }, [saveRehabLog]);
+
+  const updateRehabConfig = useCallback((updater) => {
+    setRehabConfig(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      saveRehabConfig(next);
+      return next;
+    });
+  }, [saveRehabConfig]);
 
   // Update pain log entry for a given date. `updates` is a partial entry to merge.
   const updatePainEntry = useCallback((dateISO, updates) => {
@@ -342,7 +378,7 @@ export default function App() {
 
   const handleBackup = () => {
     const backup = {
-      version: 4,
+      version: 5,
       exportedAt: new Date().toISOString(),
       setup,
       plan,
@@ -351,6 +387,8 @@ export default function App() {
       weatherLocation,
       outfitBiases,
       painLog,
+      rehabConfig,
+      rehabLog,
     };
     const content = JSON.stringify(backup, null, 2);
     const blob = new Blob([content], { type: 'application/json' });
@@ -392,6 +430,14 @@ export default function App() {
         if (data.painLog) {
           setPainLog(data.painLog);
           savePainLog(data.painLog);
+        }
+        if (data.rehabConfig) {
+          setRehabConfig(data.rehabConfig);
+          saveRehabConfig(data.rehabConfig);
+        }
+        if (data.rehabLog) {
+          setRehabLog(data.rehabLog);
+          saveRehabLog(data.rehabLog);
         }
         saveSetup(data.setup);
         savePlan(data.plan);
@@ -460,8 +506,6 @@ export default function App() {
             onToggleCompletion={toggleCompletion}
             onMoveSession={moveSession}
             onSessionClick={setSelectedSession}
-            painLog={painLog}
-            onOpenPainModal={(mode) => setPainModal({ date: todayISO(), mode })}
           />
         )}
         {view === 'arc' && plan && (
@@ -469,6 +513,16 @@ export default function App() {
             plan={plan}
             completions={completions}
             onJumpToWeek={(i) => { setCurrentWeekIdx(i); setView('week'); }}
+          />
+        )}
+        {view === 'health' && (
+          <HealthView
+            painLog={painLog}
+            onOpenPainModal={(mode) => setPainModal({ date: todayISO(), mode })}
+            rehabConfig={rehabConfig}
+            rehabLog={rehabLog}
+            onToggleRehab={(exerciseId) => toggleRehabExercise(todayISO(), exerciseId)}
+            onUpdateRehabConfig={updateRehabConfig}
           />
         )}
         {view === 'weather' && (
@@ -489,10 +543,11 @@ export default function App() {
       </main>
 
       {/* Bottom nav */}
-      {(plan || view === 'weather') && (
+      {(plan || view === 'weather' || view === 'health') && (
         <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex items-center justify-around py-2 z-10">
           {plan && <NavButton icon={Calendar} label="Week" active={view === 'week'} onClick={() => setView('week')} />}
           {plan && <NavButton icon={TrendingUp} label="Arc" active={view === 'arc'} onClick={() => setView('arc')} />}
+          <NavButton icon={Heart} label="Health" active={view === 'health'} onClick={() => setView('health')} />
           <NavButton icon={Cloud} label="Weather" active={view === 'weather'} onClick={() => setView('weather')} />
           <NavButton icon={Settings} label="Setup" active={view === 'setup'} onClick={() => setView('setup')} />
         </nav>
@@ -748,40 +803,38 @@ function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelec
 // Pain tracking UI
 // ============================================================
 
-// Compact card at top of WeekView: prompts for today's entry if missing,
-// otherwise shows summary stats + trend. Tap to open pain modal.
-function PainCard({ painLog, onOpenPainModal }) {
+// Full-page Health view — pain tracking + rehab checklist
+function HealthView({ painLog, onOpenPainModal, rehabConfig, rehabLog, onToggleRehab, onUpdateRehabConfig }) {
+  return (
+    <div>
+      <div className="mb-4">
+        <h2 className="text-base font-semibold text-slate-900 flex items-center gap-2">
+          <Heart className="h-4 w-4 text-rose-500" />
+          Health
+        </h2>
+        <p className="text-xs text-slate-500 mt-0.5">Pain tracking and rehab</p>
+      </div>
+      <PainSection painLog={painLog} onOpenPainModal={onOpenPainModal} />
+      <div className="mt-6">
+        <RehabSection
+          config={rehabConfig}
+          rehabLog={rehabLog}
+          onToggleRehab={onToggleRehab}
+          onUpdateConfig={onUpdateRehabConfig}
+        />
+      </div>
+    </div>
+  );
+}
+
+// Pain tracking section for the Health tab — full layout, always shows chart.
+function PainSection({ painLog, onOpenPainModal }) {
   const today = todayISO();
   const todayEntry = getEntryForDate(painLog, today);
   const hasTodayEntry = todayEntry !== null && (todayEntry.morningPain !== undefined || todayEntry.deskPain !== undefined);
   const stats = computeStats(painLog, today);
-  const [expanded, setExpanded] = useState(false);
-
-  // If user has no pain-tracking history at all, show a dismissible intro.
   const daysLogged = stats.daysLogged || 0;
 
-  if (!hasTodayEntry) {
-    return (
-      <div className="mb-3 bg-gradient-to-br from-rose-50 to-pink-50 border border-rose-200 rounded-lg p-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Heart className="h-4 w-4 text-rose-600" />
-            <div>
-              <p className="text-sm font-semibold text-slate-900">How's the knee today?</p>
-              <p className="text-[11px] text-slate-600">Quick check-in helps track trends over time.</p>
-            </div>
-          </div>
-          <button
-            onClick={() => onOpenPainModal('daily')}
-            className="px-3 py-1.5 bg-rose-600 text-white text-xs font-medium rounded-md hover:bg-rose-700">
-            Log
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // Has today's entry — show compact summary
   const trendIcon = stats.trend === 'improving' ? TrendingDown
     : stats.trend === 'worsening' ? TrendingUp
     : Minus;
@@ -795,87 +848,301 @@ function PainCard({ painLog, onOpenPainModal }) {
   const TrendIcon = trendIcon;
 
   return (
-    <div className="mb-3 bg-white border border-slate-200 rounded-lg p-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 flex-1 min-w-0">
-          <Heart className="h-4 w-4 text-rose-600 flex-shrink-0" />
-          <div className="flex items-baseline gap-3 flex-wrap">
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Knee pain</h3>
+        {hasTodayEntry && (
+          <button
+            onClick={() => onOpenPainModal('daily')}
+            className="text-[11px] text-slate-600 hover:text-slate-900 underline underline-offset-2">
+            Edit today
+          </button>
+        )}
+      </div>
+
+      {!hasTodayEntry ? (
+        <div className="bg-gradient-to-br from-rose-50 to-pink-50 border border-rose-200 rounded-lg p-4 mb-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <Heart className="h-5 w-5 text-rose-600 flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-900">How's the knee today?</p>
+                <p className="text-[11px] text-slate-600">A quick check-in helps track trends over time.</p>
+              </div>
+            </div>
+            <button
+              onClick={() => onOpenPainModal('daily')}
+              className="px-4 py-2 bg-rose-600 text-white text-sm font-medium rounded-md hover:bg-rose-700 flex-shrink-0">
+              Log now
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="bg-white border border-slate-200 rounded-lg p-3 mb-3">
+          <div className="flex items-center gap-4 flex-wrap">
             <div>
               <span className="text-[10px] text-slate-500 uppercase tracking-wide">Today</span>
-              <div className="flex items-center gap-2">
-                <span className="text-lg font-semibold text-slate-900">
-                  {todayEntry.morningPain ?? '—'}
-                </span>
-                <span className="text-[10px] text-slate-500">AM</span>
+              <div className="flex items-center gap-2 mt-0.5">
+                {todayEntry.morningPain !== undefined && (
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-xl font-semibold text-slate-900">{todayEntry.morningPain}</span>
+                    <span className="text-[10px] text-slate-500">AM</span>
+                  </div>
+                )}
                 {todayEntry.deskPain !== undefined && (
-                  <>
-                    <span className="text-lg font-semibold text-slate-900 ml-1">
-                      {todayEntry.deskPain}
-                    </span>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-xl font-semibold text-slate-900">{todayEntry.deskPain}</span>
                     <span className="text-[10px] text-slate-500">desk</span>
-                  </>
+                  </div>
                 )}
                 {todayEntry.postRunPain !== undefined && (
-                  <>
-                    <span className="text-lg font-semibold text-slate-900 ml-1">
-                      {todayEntry.postRunPain}
-                    </span>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-xl font-semibold text-slate-900">{todayEntry.postRunPain}</span>
                     <span className="text-[10px] text-slate-500">run</span>
-                  </>
+                  </div>
                 )}
               </div>
             </div>
             {stats.trend && (
               <div className={`flex items-center gap-1 ${trendColor}`}>
-                <TrendIcon className="h-3.5 w-3.5" />
-                <span className="text-[11px] font-medium">{trendLabel}</span>
+                <TrendIcon className="h-4 w-4" />
+                <span className="text-xs font-medium">{trendLabel}</span>
               </div>
             )}
             {stats.painFreeStreak >= 3 && (
-              <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 rounded px-1.5 py-0.5">
-                {stats.painFreeStreak}d streak
+              <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 rounded px-2 py-0.5">
+                {stats.painFreeStreak}d under 2/10
               </span>
             )}
           </div>
+          {todayEntry.note && (
+            <p className="text-[11px] text-slate-600 italic mt-2 pl-0.5">"{todayEntry.note}"</p>
+          )}
         </div>
-        <div className="flex items-center gap-1 flex-shrink-0">
-          <button
-            onClick={() => onOpenPainModal('daily')}
-            className="text-[11px] text-slate-600 hover:text-slate-900 px-2 py-1">
-            Edit
-          </button>
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="text-[11px] text-slate-600 hover:text-slate-900 px-2 py-1">
-            {expanded ? 'Hide' : 'Chart'}
-          </button>
-        </div>
-      </div>
+      )}
 
-      {expanded && (
-        <div className="mt-3 pt-3 border-t border-slate-100">
+      {daysLogged >= 2 && (
+        <div className="bg-white border border-slate-200 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-[10px] font-semibold text-slate-600 uppercase tracking-wide">Last 30 days</h4>
+            {daysLogged >= 3 && (
+              <button
+                onClick={() => {
+                  const csv = painLogToCSV(painLog);
+                  const blob = new Blob([csv], { type: 'text/csv' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `knee-pain-log-${today}.csv`;
+                  a.click();
+                  setTimeout(() => URL.revokeObjectURL(url), 1000);
+                }}
+                className="text-[10px] text-slate-500 hover:text-slate-900 underline underline-offset-2">
+                Export CSV
+              </button>
+            )}
+          </div>
           <PainChart painLog={painLog} />
-          <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+          <div className="mt-3 grid grid-cols-3 gap-2 text-center">
             <Stat label="Avg AM (7d)" value={stats.avgMorning7 !== null ? stats.avgMorning7 : '—'} />
             <Stat label="Avg desk (7d)" value={stats.avgDesk7 !== null ? stats.avgDesk7 : '—'} />
             <Stat label="Days logged" value={`${daysLogged}/14`} />
           </div>
-          {daysLogged >= 3 && (
-            <button
-              onClick={() => {
-                const csv = painLogToCSV(painLog);
-                const blob = new Blob([csv], { type: 'text/csv' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `knee-pain-log-${today}.csv`;
-                a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-              }}
-              className="mt-3 w-full text-[11px] text-slate-600 hover:text-slate-900 py-1.5 border border-slate-200 rounded-md">
-              Export CSV for PT visit
-            </button>
-          )}
+        </div>
+      )}
+
+      {daysLogged < 2 && hasTodayEntry && (
+        <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-center">
+          <p className="text-[11px] text-slate-500">Log for a few days to see your trend chart here.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Rehab checklist section: list of exercises with daily checkboxes + consistency grid
+function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
+  const today = todayISO();
+  const [editing, setEditing] = useState(false);
+  const [newExerciseName, setNewExerciseName] = useState('');
+  const [newExerciseNote, setNewExerciseNote] = useState('');
+
+  const exercises = config.exercises || [];
+  const { done, total } = getRehabCountForDate(rehabLog, today, exercises.length);
+  const stats = computeRehabStats(rehabLog, exercises.length, today);
+  const grid = getRehabGridData(rehabLog, 14, today);
+
+  const handleAdd = () => {
+    const name = newExerciseName.trim();
+    if (!name) return;
+    const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + Date.now().toString(36);
+    onUpdateConfig(prev => ({
+      ...prev,
+      exercises: [...(prev.exercises || []), { id, name, note: newExerciseNote.trim() || undefined }],
+    }));
+    setNewExerciseName('');
+    setNewExerciseNote('');
+  };
+
+  const handleRemove = (id) => {
+    if (!confirm('Remove this exercise from your list? (Past completion records are kept.)')) return;
+    onUpdateConfig(prev => ({
+      ...prev,
+      exercises: (prev.exercises || []).filter(e => e.id !== id),
+    }));
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Rehab / Strength</h3>
+        <button
+          onClick={() => setEditing(!editing)}
+          className="text-[11px] text-slate-600 hover:text-slate-900 underline underline-offset-2">
+          {editing ? 'Done editing' : 'Edit list'}
+        </button>
+      </div>
+
+      {/* Today header */}
+      <div className="bg-white border border-slate-200 rounded-lg p-3 mb-3">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <span className="text-[10px] text-slate-500 uppercase tracking-wide">Today</span>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className="text-xl font-semibold text-slate-900">{done}/{total}</span>
+              <span className="text-xs text-slate-500">done</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {stats.streak >= 2 && (
+              <span className="text-[11px] font-semibold text-purple-700 bg-purple-50 rounded px-2 py-0.5">
+                {stats.streak}d streak
+              </span>
+            )}
+            {stats.daysDone7 >= 1 && (
+              <span className="text-[11px] text-slate-600">
+                {stats.daysDone7}/7 days this week
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Exercise checklist */}
+        {exercises.length === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-4">
+            No exercises yet. Tap "Edit list" to add the ones your PT prescribed.
+          </p>
+        ) : (
+          <div className="space-y-1.5">
+            {exercises.map(ex => {
+              const done = wasExerciseDone(rehabLog, today, ex.id);
+              return (
+                <div key={ex.id} className="flex items-center gap-2">
+                  <button
+                    onClick={() => !editing && onToggleRehab(ex.id)}
+                    disabled={editing}
+                    className={`flex items-center gap-2 flex-1 text-left p-2 rounded-md border transition ${
+                      done
+                        ? 'bg-purple-50 border-purple-200 text-purple-900'
+                        : 'bg-white border-slate-200 hover:border-slate-300'
+                    } ${editing ? 'opacity-60 cursor-not-allowed' : ''}`}>
+                    {done
+                      ? <CheckCircle2 className="h-4 w-4 text-purple-600 flex-shrink-0" />
+                      : <Circle className="h-4 w-4 text-slate-400 flex-shrink-0" />
+                    }
+                    <div className="min-w-0 flex-1">
+                      <p className={`text-sm font-medium truncate ${done ? 'line-through text-purple-900/70' : 'text-slate-900'}`}>
+                        {ex.name}
+                      </p>
+                      {ex.note && (
+                        <p className="text-[10px] text-slate-500 truncate">{ex.note}</p>
+                      )}
+                    </div>
+                  </button>
+                  {editing && (
+                    <button
+                      onClick={() => handleRemove(ex.id)}
+                      className="p-2 text-slate-400 hover:text-rose-600 flex-shrink-0"
+                      title="Remove">
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Add form shown while editing */}
+        {editing && (
+          <div className="mt-3 pt-3 border-t border-slate-100">
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={newExerciseName}
+                onChange={e => setNewExerciseName(e.target.value)}
+                placeholder="Exercise name (e.g. Clamshells)"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+              />
+              <input
+                type="text"
+                value={newExerciseNote}
+                onChange={e => setNewExerciseNote(e.target.value)}
+                placeholder="Prescription (e.g. 3x15 each side) — optional"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+              />
+              <button
+                onClick={handleAdd}
+                disabled={!newExerciseName.trim()}
+                className="w-full py-2 bg-purple-600 text-white rounded-md text-sm font-medium hover:bg-purple-700 disabled:bg-slate-300 disabled:cursor-not-allowed flex items-center justify-center gap-1">
+                <Plus className="h-4 w-4" />
+                Add exercise
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Consistency grid: last 14 days */}
+      {exercises.length > 0 && (
+        <div className="bg-white border border-slate-200 rounded-lg p-3">
+          <h4 className="text-[10px] font-semibold text-slate-600 uppercase tracking-wide mb-2">Last 14 days</h4>
+          <div className="flex gap-1">
+            {grid.map((day, i) => {
+              const pct = exercises.length > 0 ? day.count / exercises.length : 0;
+              const bg = day.count === 0 ? 'bg-slate-100'
+                : pct >= 1 ? 'bg-purple-600'
+                : pct >= 0.5 ? 'bg-purple-400'
+                : 'bg-purple-200';
+              const [mm, dd] = day.date.slice(5).split('-');
+              return (
+                <div
+                  key={day.date}
+                  className="flex-1 flex flex-col items-center"
+                  title={`${day.date}: ${day.count}/${exercises.length}`}>
+                  <div className={`w-full h-8 rounded ${bg}`} />
+                  <span className="text-[8px] text-slate-400 mt-1">{Number(dd)}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-between mt-3 text-[10px] text-slate-500">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 rounded bg-slate-100" />
+                <span>None</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 rounded bg-purple-200" />
+                <span>Partial</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 rounded bg-purple-600" />
+                <span>All</span>
+              </div>
+            </div>
+            <span>{stats.completionRate7}% this week</span>
+          </div>
         </div>
       )}
     </div>
@@ -1129,7 +1396,7 @@ function PainSlider({ label, sublabel, value, onChange, optional }) {
   );
 }
 
-function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick, painLog, onOpenPainModal }) {
+function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick }) {
   // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
   const [moveSelection, setMoveSelection] = useState(null);
   const week = plan[currentWeekIdx];
@@ -1166,9 +1433,6 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, 
 
   return (
     <div>
-      {/* Pain tracking card — at top so it's the first thing the user sees */}
-      <PainCard painLog={painLog} onOpenPainModal={onOpenPainModal} />
-
       <div className="flex items-center justify-between mb-3 bg-white rounded-lg border border-slate-200 p-3">
         <button onClick={() => setCurrentWeekIdx(Math.max(0, currentWeekIdx - 1))}
           disabled={currentWeekIdx === 0}

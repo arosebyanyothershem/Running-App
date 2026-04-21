@@ -4,6 +4,7 @@ import {
   Activity, Dumbbell, Footprints, TrendingUp, RotateCcw, AlertCircle,
   GripVertical, Sunrise, Zap, Download, Watch, Share2, Info, Copy,
   Cloud, MapPin, Wind, Droplets, Shirt, ThermometerSun, ThermometerSnowflake,
+  Heart, X, TrendingDown, Minus,
 } from 'lucide-react';
 
 import { storage } from './storage.js';
@@ -11,6 +12,7 @@ import { DAYS, paceFromSeconds, computePaces, computeHRzones, generatePlan } fro
 import { downloadICS } from './icsExport.js';
 import { downloadTCX } from './tcxExport.js';
 import { geocodeZip, fetchForecast, pickHour, describeWeather, compassFromDeg, recommendOutfit, applyFeedback, getBandForTemp, EMPTY_BIASES } from './weather.js';
+import { getEntryForDate, hasDailyEntry, getRecentEntries, computeStats, painLogToCSV } from './painTracking.js';
 
 const SESSION_COLORS = {
   activation: { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-900', icon: Sunrise },
@@ -70,6 +72,9 @@ export default function App() {
   // Weather state
   const [weatherLocation, setWeatherLocation] = useState(null); // { zip, lat, lon, city, state }
   const [outfitBiases, setOutfitBiases] = useState(EMPTY_BIASES);
+  // Pain tracking state: { [dateISO]: { morningPain, deskPain, postRunPain, note } }
+  const [painLog, setPainLog] = useState({});
+  const [painModal, setPainModal] = useState(null); // null | { date, mode: 'daily' | 'postRun' }
 
   useEffect(() => {
     const load = async () => {
@@ -107,6 +112,10 @@ export default function App() {
         const ob = await storage.get('outfitBiases');
         if (ob) setOutfitBiases({ ...EMPTY_BIASES, ...JSON.parse(ob.value) });
       } catch {}
+      try {
+        const pl = await storage.get('painLog');
+        if (pl) setPainLog(JSON.parse(pl.value));
+      } catch {}
       setLoading(false);
     };
     load();
@@ -118,6 +127,22 @@ export default function App() {
   const saveLogs = useCallback(async (l) => { await storage.set('logs', JSON.stringify(l)); }, []);
   const saveWeatherLocation = useCallback(async (wl) => { await storage.set('weatherLocation', JSON.stringify(wl)); }, []);
   const saveOutfitBiases = useCallback(async (ob) => { await storage.set('outfitBiases', JSON.stringify(ob)); }, []);
+  const savePainLog = useCallback(async (pl) => { await storage.set('painLog', JSON.stringify(pl)); }, []);
+
+  // Update pain log entry for a given date. `updates` is a partial entry to merge.
+  const updatePainEntry = useCallback((dateISO, updates) => {
+    setPainLog(prev => {
+      const existing = prev[dateISO] || {};
+      // Merge; allow null to clear a field, but drop undefined keys
+      const merged = { ...existing };
+      Object.keys(updates).forEach(k => {
+        if (updates[k] !== undefined) merged[k] = updates[k];
+      });
+      const next = { ...prev, [dateISO]: merged };
+      savePainLog(next);
+      return next;
+    });
+  }, [savePainLog]);
 
   const updateWeatherLocation = (loc) => {
     setWeatherLocation(loc);
@@ -282,6 +307,7 @@ export default function App() {
 
   const updateLog = (key, log) => {
     const updated = { ...logs };
+    const isNewLog = !logs[key] && log !== null && log !== undefined;
     if (log === null || log === undefined) {
       delete updated[key];
     } else {
@@ -289,6 +315,15 @@ export default function App() {
     }
     setLogs(updated);
     saveLogs(updated);
+    // After logging a NEW run, prompt for post-run pain if not already captured today
+    if (isNewLog) {
+      const today = todayISO();
+      const todayEntry = painLog[today];
+      if (!todayEntry || todayEntry.postRunPain === undefined) {
+        // Defer so session modal closes first
+        setTimeout(() => setPainModal({ date: today, mode: 'postRun' }), 200);
+      }
+    }
   };
 
   const moveSession = (weekIdx, fromDay, toDay, sessionId) => {
@@ -307,7 +342,7 @@ export default function App() {
 
   const handleBackup = () => {
     const backup = {
-      version: 3,
+      version: 4,
       exportedAt: new Date().toISOString(),
       setup,
       plan,
@@ -315,6 +350,7 @@ export default function App() {
       logs,
       weatherLocation,
       outfitBiases,
+      painLog,
     };
     const content = JSON.stringify(backup, null, 2);
     const blob = new Blob([content], { type: 'application/json' });
@@ -338,7 +374,7 @@ export default function App() {
           alert('That file does not look like a Singles Planner backup.');
           return;
         }
-        if (plan && !confirm('Restore from backup? This will REPLACE your current plan, completion history, run logs, and weather settings.')) {
+        if (plan && !confirm('Restore from backup? This will REPLACE your current plan, completion history, run logs, weather settings, and pain log.')) {
           return;
         }
         setSetup(data.setup);
@@ -352,6 +388,10 @@ export default function App() {
         if (data.outfitBiases) {
           setOutfitBiases({ ...EMPTY_BIASES, ...data.outfitBiases });
           saveOutfitBiases(data.outfitBiases);
+        }
+        if (data.painLog) {
+          setPainLog(data.painLog);
+          savePainLog(data.painLog);
         }
         saveSetup(data.setup);
         savePlan(data.plan);
@@ -420,6 +460,8 @@ export default function App() {
             onToggleCompletion={toggleCompletion}
             onMoveSession={moveSession}
             onSessionClick={setSelectedSession}
+            painLog={painLog}
+            onOpenPainModal={(mode) => setPainModal({ date: todayISO(), mode })}
           />
         )}
         {view === 'arc' && plan && (
@@ -467,6 +509,21 @@ export default function App() {
           paces={paces}
           hr={hrZones}
           onClose={() => setSelectedSession(null)}
+        />
+      )}
+
+      {/* Pain tracking modal */}
+      {painModal && (
+        <PainModal
+          date={painModal.date}
+          mode={painModal.mode}
+          existingEntry={getEntryForDate(painLog, painModal.date)}
+          painLog={painLog}
+          onSave={(updates) => {
+            updatePainEntry(painModal.date, updates);
+            setPainModal(null);
+          }}
+          onClose={() => setPainModal(null)}
         />
       )}
     </div>
@@ -687,7 +744,392 @@ function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelec
   );
 }
 
-function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick }) {
+// ============================================================
+// Pain tracking UI
+// ============================================================
+
+// Compact card at top of WeekView: prompts for today's entry if missing,
+// otherwise shows summary stats + trend. Tap to open pain modal.
+function PainCard({ painLog, onOpenPainModal }) {
+  const today = todayISO();
+  const todayEntry = getEntryForDate(painLog, today);
+  const hasTodayEntry = todayEntry !== null && (todayEntry.morningPain !== undefined || todayEntry.deskPain !== undefined);
+  const stats = computeStats(painLog, today);
+  const [expanded, setExpanded] = useState(false);
+
+  // If user has no pain-tracking history at all, show a dismissible intro.
+  const daysLogged = stats.daysLogged || 0;
+
+  if (!hasTodayEntry) {
+    return (
+      <div className="mb-3 bg-gradient-to-br from-rose-50 to-pink-50 border border-rose-200 rounded-lg p-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Heart className="h-4 w-4 text-rose-600" />
+            <div>
+              <p className="text-sm font-semibold text-slate-900">How's the knee today?</p>
+              <p className="text-[11px] text-slate-600">Quick check-in helps track trends over time.</p>
+            </div>
+          </div>
+          <button
+            onClick={() => onOpenPainModal('daily')}
+            className="px-3 py-1.5 bg-rose-600 text-white text-xs font-medium rounded-md hover:bg-rose-700">
+            Log
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Has today's entry — show compact summary
+  const trendIcon = stats.trend === 'improving' ? TrendingDown
+    : stats.trend === 'worsening' ? TrendingUp
+    : Minus;
+  const trendColor = stats.trend === 'improving' ? 'text-emerald-600'
+    : stats.trend === 'worsening' ? 'text-amber-600'
+    : 'text-slate-500';
+  const trendLabel = stats.trend === 'improving' ? 'Improving'
+    : stats.trend === 'worsening' ? 'Worsening'
+    : stats.trend === 'flat' ? 'Stable'
+    : 'Early data';
+  const TrendIcon = trendIcon;
+
+  return (
+    <div className="mb-3 bg-white border border-slate-200 rounded-lg p-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 flex-1 min-w-0">
+          <Heart className="h-4 w-4 text-rose-600 flex-shrink-0" />
+          <div className="flex items-baseline gap-3 flex-wrap">
+            <div>
+              <span className="text-[10px] text-slate-500 uppercase tracking-wide">Today</span>
+              <div className="flex items-center gap-2">
+                <span className="text-lg font-semibold text-slate-900">
+                  {todayEntry.morningPain ?? '—'}
+                </span>
+                <span className="text-[10px] text-slate-500">AM</span>
+                {todayEntry.deskPain !== undefined && (
+                  <>
+                    <span className="text-lg font-semibold text-slate-900 ml-1">
+                      {todayEntry.deskPain}
+                    </span>
+                    <span className="text-[10px] text-slate-500">desk</span>
+                  </>
+                )}
+                {todayEntry.postRunPain !== undefined && (
+                  <>
+                    <span className="text-lg font-semibold text-slate-900 ml-1">
+                      {todayEntry.postRunPain}
+                    </span>
+                    <span className="text-[10px] text-slate-500">run</span>
+                  </>
+                )}
+              </div>
+            </div>
+            {stats.trend && (
+              <div className={`flex items-center gap-1 ${trendColor}`}>
+                <TrendIcon className="h-3.5 w-3.5" />
+                <span className="text-[11px] font-medium">{trendLabel}</span>
+              </div>
+            )}
+            {stats.painFreeStreak >= 3 && (
+              <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 rounded px-1.5 py-0.5">
+                {stats.painFreeStreak}d streak
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <button
+            onClick={() => onOpenPainModal('daily')}
+            className="text-[11px] text-slate-600 hover:text-slate-900 px-2 py-1">
+            Edit
+          </button>
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="text-[11px] text-slate-600 hover:text-slate-900 px-2 py-1">
+            {expanded ? 'Hide' : 'Chart'}
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-slate-100">
+          <PainChart painLog={painLog} />
+          <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+            <Stat label="Avg AM (7d)" value={stats.avgMorning7 !== null ? stats.avgMorning7 : '—'} />
+            <Stat label="Avg desk (7d)" value={stats.avgDesk7 !== null ? stats.avgDesk7 : '—'} />
+            <Stat label="Days logged" value={`${daysLogged}/14`} />
+          </div>
+          {daysLogged >= 3 && (
+            <button
+              onClick={() => {
+                const csv = painLogToCSV(painLog);
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `knee-pain-log-${today}.csv`;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+              }}
+              className="mt-3 w-full text-[11px] text-slate-600 hover:text-slate-900 py-1.5 border border-slate-200 rounded-md">
+              Export CSV for PT visit
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="bg-slate-50 rounded p-2">
+      <div className="text-lg font-semibold text-slate-900">{value}</div>
+      <div className="text-[9px] text-slate-500 uppercase tracking-wide">{label}</div>
+    </div>
+  );
+}
+
+// 30-day SVG line chart of pain metrics
+function PainChart({ painLog }) {
+  const today = todayISO();
+  const days = getRecentEntries(painLog, 30, today);
+  const W = 320, H = 120, PAD_L = 22, PAD_R = 8, PAD_T = 8, PAD_B = 18;
+  const innerW = W - PAD_L - PAD_R, innerH = H - PAD_T - PAD_B;
+  const xAt = (i) => PAD_L + (i / (days.length - 1)) * innerW;
+  const yAt = (v) => PAD_T + (1 - v / 10) * innerH;
+
+  // Build paths for each metric, breaking where data is missing
+  const buildPath = (field) => {
+    const segments = [];
+    let current = [];
+    days.forEach((d, i) => {
+      const v = d.entry?.[field];
+      if (typeof v === 'number') {
+        current.push(`${current.length === 0 ? 'M' : 'L'}${xAt(i).toFixed(1)} ${yAt(v).toFixed(1)}`);
+      } else {
+        if (current.length > 0) segments.push(current.join(' '));
+        current = [];
+      }
+    });
+    if (current.length > 0) segments.push(current.join(' '));
+    return segments.join(' ');
+  };
+
+  const morningPath = buildPath('morningPain');
+  const deskPath = buildPath('deskPain');
+  const runPath = buildPath('postRunPain');
+
+  // Run-day markers
+  const runDays = days.map((d, i) => ({ i, v: d.entry?.postRunPain }))
+    .filter(d => typeof d.v === 'number');
+
+  // Find first and last date labels
+  const firstLabel = days[0]?.date ? days[0].date.slice(5).replace('-', '/') : '';
+  const lastLabel = days[days.length - 1]?.date ? days[days.length - 1].date.slice(5).replace('-', '/') : '';
+
+  return (
+    <div className="w-full">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+        {/* Y-axis gridlines at 0, 2, 5, 8, 10 */}
+        {[0, 2, 5, 8, 10].map(v => (
+          <g key={v}>
+            <line x1={PAD_L} y1={yAt(v)} x2={W - PAD_R} y2={yAt(v)}
+              stroke="#e2e8f0" strokeWidth="1" strokeDasharray={v === 0 || v === 10 ? '0' : '2,2'} />
+            <text x={PAD_L - 3} y={yAt(v) + 3} textAnchor="end"
+              fontSize="8" fill="#94a3b8">{v}</text>
+          </g>
+        ))}
+
+        {/* Data paths */}
+        {morningPath && <path d={morningPath} fill="none" stroke="#0f766e" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />}
+        {deskPath && <path d={deskPath} fill="none" stroke="#9333ea" strokeWidth="1.25" strokeDasharray="3,2" strokeLinecap="round" strokeLinejoin="round" />}
+
+        {/* Morning pain data points */}
+        {days.map((d, i) => {
+          const v = d.entry?.morningPain;
+          if (typeof v !== 'number') return null;
+          return <circle key={`m${i}`} cx={xAt(i)} cy={yAt(v)} r="1.75" fill="#0f766e" />;
+        })}
+
+        {/* Post-run pain points (larger, filled with accent) */}
+        {runDays.map(({ i, v }) => (
+          <circle key={`r${i}`} cx={xAt(i)} cy={yAt(v)} r="3.25" fill="#dc2626" stroke="white" strokeWidth="1.5" />
+        ))}
+
+        {/* X-axis labels */}
+        <text x={PAD_L} y={H - 4} fontSize="8" fill="#94a3b8">{firstLabel}</text>
+        <text x={W - PAD_R} y={H - 4} fontSize="8" fill="#94a3b8" textAnchor="end">{lastLabel}</text>
+      </svg>
+
+      {/* Legend */}
+      <div className="flex items-center justify-center gap-4 mt-1 text-[9px] text-slate-600">
+        <div className="flex items-center gap-1">
+          <div className="w-3 h-0.5 bg-teal-700" />
+          <span>Morning</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <div className="w-3 h-0.5 bg-purple-600" style={{ borderTop: '1px dashed #9333ea', height: 0 }} />
+          <span>Desk</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <div className="w-2 h-2 rounded-full bg-red-600" />
+          <span>Post-run</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Modal for entering pain ratings
+function PainModal({ date, mode, existingEntry, painLog, onSave, onClose }) {
+  const initial = existingEntry || {};
+  const [morningPain, setMorningPain] = useState(initial.morningPain ?? null);
+  const [deskPain, setDeskPain] = useState(initial.deskPain ?? null);
+  const [postRunPain, setPostRunPain] = useState(initial.postRunPain ?? null);
+  const [note, setNote] = useState(initial.note || '');
+
+  const handleSave = () => {
+    const updates = {};
+    if (morningPain !== null) updates.morningPain = morningPain;
+    if (deskPain !== null) updates.deskPain = deskPain;
+    if (postRunPain !== null) updates.postRunPain = postRunPain;
+    if (note.trim()) updates.note = note.trim();
+    onSave(updates);
+  };
+
+  const [y, m, d] = date.split('-').map(Number);
+  const displayDate = `${m}/${d}/${y}`;
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl p-5 max-h-[90vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+              <Heart className="h-4 w-4 text-rose-600" />
+              Knee pain · {displayDate}
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">Rate 0 (none) to 10 (worst imaginable)</p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <PainSlider
+            label="Morning pain"
+            sublabel="When you first stand up"
+            value={morningPain}
+            onChange={setMorningPain}
+          />
+          <PainSlider
+            label="Desk pain"
+            sublabel="After prolonged sitting, extending the leg"
+            value={deskPain}
+            onChange={setDeskPain}
+          />
+          <PainSlider
+            label="Post-run pain"
+            sublabel="Only if you ran today"
+            value={postRunPain}
+            onChange={setPostRunPain}
+            optional
+          />
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 mb-1">
+              Note <span className="font-normal text-slate-400">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={note}
+              onChange={e => setNote(e.target.value)}
+              maxLength={140}
+              placeholder="e.g. flared at mile 3, better after foam rolling"
+              className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-transparent"
+            />
+          </div>
+        </div>
+
+        <div className="mt-5 flex gap-2">
+          <button
+            onClick={onClose}
+            className="flex-1 py-2.5 border border-slate-300 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50">
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={morningPain === null && deskPain === null && postRunPain === null}
+            className="flex-1 py-2.5 bg-rose-600 text-white rounded-md text-sm font-medium hover:bg-rose-700 disabled:bg-slate-300 disabled:cursor-not-allowed">
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 0-10 slider with value display and clear button
+function PainSlider({ label, sublabel, value, onChange, optional }) {
+  const isSet = value !== null;
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1">
+        <div>
+          <label className="text-xs font-semibold text-slate-700">{label}</label>
+          {sublabel && <p className="text-[10px] text-slate-500">{sublabel}</p>}
+        </div>
+        <div className="flex items-center gap-2">
+          {isSet ? (
+            <>
+              <span className={`text-base font-bold ${value >= 6 ? 'text-rose-600' : value >= 3 ? 'text-amber-600' : 'text-emerald-600'}`}>
+                {value}
+              </span>
+              <button
+                onClick={() => onChange(null)}
+                className="text-[10px] text-slate-400 hover:text-slate-700">
+                Clear
+              </button>
+            </>
+          ) : (
+            <span className="text-[10px] text-slate-400">
+              {optional ? 'Not set' : 'Tap scale below'}
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="grid grid-cols-11 gap-0.5">
+        {Array.from({ length: 11 }).map((_, i) => {
+          const selected = value === i;
+          const color = i === 0 ? 'bg-emerald-500'
+            : i <= 2 ? 'bg-emerald-400'
+            : i <= 4 ? 'bg-yellow-400'
+            : i <= 6 ? 'bg-amber-500'
+            : i <= 8 ? 'bg-orange-500'
+            : 'bg-rose-600';
+          return (
+            <button
+              key={i}
+              onClick={() => onChange(i)}
+              className={`h-10 rounded text-xs font-medium transition ${
+                selected ? `${color} text-white ring-2 ring-offset-1 ring-slate-900` : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`}>
+              {i}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick, painLog, onOpenPainModal }) {
   // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
   const [moveSelection, setMoveSelection] = useState(null);
   const week = plan[currentWeekIdx];
@@ -724,6 +1166,9 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, 
 
   return (
     <div>
+      {/* Pain tracking card — at top so it's the first thing the user sees */}
+      <PainCard painLog={painLog} onOpenPainModal={onOpenPainModal} />
+
       <div className="flex items-center justify-between mb-3 bg-white rounded-lg border border-slate-200 p-3">
         <button onClick={() => setCurrentWeekIdx(Math.max(0, currentWeekIdx - 1))}
           disabled={currentWeekIdx === 0}

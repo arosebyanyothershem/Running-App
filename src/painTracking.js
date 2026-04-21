@@ -120,3 +120,93 @@ export function painLogToCSV(painLog) {
   });
   return rows.map(r => r.map(c => typeof c === 'string' && c.includes(',') ? `"${c}"` : c).join(',')).join('\n');
 }
+
+// ============================================================
+// Rehab checklist logic
+// ============================================================
+//
+// Rehab config shape:
+//   { exercises: [{ id: string, name: string, note?: string }], createdAt: ISO }
+//
+// Rehab log shape:
+//   { [dateISO]: { [exerciseId]: true } }  — missing exercises = not done
+
+export const DEFAULT_REHAB_CONFIG = {
+  exercises: [
+    { id: 'sl-leg-raise', name: 'Side-lying leg raises (right)', note: '30 reps' },
+    { id: 'clamshells', name: 'Clamshells with band (right)', note: '30 reps' },
+    { id: 'sl-bridge', name: 'Single-leg glute bridges', note: '2x10 each side' },
+    { id: 'wall-sit', name: 'Wall sit with band outward press', note: '3x30s' },
+  ],
+  createdAt: new Date().toISOString(),
+};
+
+// Count exercises completed for a given date
+export function getRehabCountForDate(rehabLog, dateISO, totalExercises) {
+  const entry = rehabLog?.[dateISO];
+  if (!entry) return { done: 0, total: totalExercises };
+  const done = Object.values(entry).filter(Boolean).length;
+  return { done, total: totalExercises };
+}
+
+// Was a specific exercise done on a given date?
+export function wasExerciseDone(rehabLog, dateISO, exerciseId) {
+  return !!(rehabLog?.[dateISO]?.[exerciseId]);
+}
+
+// Rehab streak: consecutive days ending today where at least 1 exercise was done
+export function getRehabStreak(rehabLog, todayISO) {
+  const [y, m, d] = todayISO.split('-').map(Number);
+  const today = new Date(y, m - 1, d);
+  let streak = 0;
+  for (let i = 0; i < 60; i++) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - i);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    const key = `${yyyy}-${mm}-${dd}`;
+    const entry = rehabLog?.[key];
+    const didAny = entry && Object.values(entry).some(Boolean);
+    if (didAny) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+// Get last N days of rehab data for a consistency grid display
+export function getRehabGridData(rehabLog, days = 14, todayISO) {
+  const result = [];
+  const [y, m, d] = todayISO.split('-').map(Number);
+  const today = new Date(y, m - 1, d);
+  for (let i = days - 1; i >= 0; i--) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - i);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    const key = `${yyyy}-${mm}-${dd}`;
+    const entry = rehabLog?.[key];
+    const count = entry ? Object.values(entry).filter(Boolean).length : 0;
+    result.push({ date: key, count, dayOfWeek: date.getDay() });
+  }
+  return result;
+}
+
+// Compute rehab-compliance stats for last 7 and 14 days
+export function computeRehabStats(rehabLog, totalExercises, todayISO) {
+  const days7 = getRehabGridData(rehabLog, 7, todayISO);
+  const days14 = getRehabGridData(rehabLog, 14, todayISO);
+  const daysDone7 = days7.filter(d => d.count > 0).length;
+  const daysDone14 = days14.filter(d => d.count > 0).length;
+  const streak = getRehabStreak(rehabLog, todayISO);
+  return {
+    daysDone7,
+    daysDone14,
+    streak,
+    completionRate7: Math.round((daysDone7 / 7) * 100),
+  };
+}

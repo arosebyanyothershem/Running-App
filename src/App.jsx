@@ -21,6 +21,7 @@ const SESSION_COLORS = {
   subT: { bg: 'bg-rose-50', border: 'border-rose-200', text: 'text-rose-900', icon: TrendingUp },
   long: { bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-900', icon: Activity },
   strength: { bg: 'bg-purple-50', border: 'border-purple-200', text: 'text-purple-900', icon: Dumbbell },
+  cross: { bg: 'bg-cyan-50', border: 'border-cyan-200', text: 'text-cyan-900', icon: Activity },
 };
 
 // Format a Date object as YYYY-MM-DD in LOCAL time (not UTC).
@@ -78,6 +79,9 @@ export default function App() {
   // Rehab tracking
   const [rehabConfig, setRehabConfig] = useState(DEFAULT_REHAB_CONFIG); // { exercises: [...] }
   const [rehabLog, setRehabLog] = useState({}); // { [dateISO]: { [exerciseId]: true } }
+  const [showMethodModal, setShowMethodModal] = useState(false);
+  // When adding an unscheduled session: { weekIdx, dayIdx } — null means closed
+  const [addSessionTarget, setAddSessionTarget] = useState(null);
 
   useEffect(() => {
     const load = async () => {
@@ -185,8 +189,8 @@ export default function App() {
     saveWeatherLocation(loc);
   };
 
-  const handleOutfitFeedback = (band, feedback) => {
-    const updated = applyFeedback(outfitBiases, band, feedback);
+  const handleOutfitFeedback = (band, feedback, context) => {
+    const updated = applyFeedback(outfitBiases, band, feedback, context);
     setOutfitBiases(updated);
     saveOutfitBiases(updated);
   };
@@ -376,6 +380,25 @@ export default function App() {
     savePlan(newPlan);
   };
 
+  // Add an unscheduled session to a specific day.
+  // sessionData: { type, label, miles?, crossType?, durationMin? }
+  // Cross-train sessions track activity subtype (e.g. "Cycling") + duration;
+  // they do not contribute to weekly running mileage counts.
+  const addUnscheduledSession = (weekIdx, dayIdx, sessionData) => {
+    const id = `unscheduled-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const newSession = { id, unscheduled: true, ...sessionData };
+    const newPlan = plan.map((week, i) => {
+      if (i !== weekIdx) return week;
+      const newDays = week.days.map((d, di) => {
+        if (di !== dayIdx) return d;
+        return { ...d, sessions: [...d.sessions, newSession] };
+      });
+      return { ...week, days: newDays };
+    });
+    setPlan(newPlan);
+    savePlan(newPlan);
+  };
+
   const handleBackup = () => {
     const backup = {
       version: 5,
@@ -494,6 +517,7 @@ export default function App() {
             onBackup={handleBackup}
             onRestore={handleRestore}
             hasPlan={!!plan}
+            onShowMethod={() => setShowMethodModal(true)}
           />
         )}
         {view === 'week' && plan && (
@@ -506,6 +530,7 @@ export default function App() {
             onToggleCompletion={toggleCompletion}
             onMoveSession={moveSession}
             onSessionClick={setSelectedSession}
+            onAddSessionRequest={(dayIdx) => setAddSessionTarget({ weekIdx: currentWeekIdx, dayIdx })}
           />
         )}
         {view === 'arc' && plan && (
@@ -572,13 +597,31 @@ export default function App() {
         <PainModal
           date={painModal.date}
           mode={painModal.mode}
-          existingEntry={getEntryForDate(painLog, painModal.date)}
           painLog={painLog}
-          onSave={(updates) => {
-            updatePainEntry(painModal.date, updates);
-            setPainModal(null);
+          onSave={(dateISO, updates, opts) => {
+            updatePainEntry(dateISO, updates);
+            if (!opts || !opts.keepOpen) setPainModal(null);
           }}
           onClose={() => setPainModal(null)}
+        />
+      )}
+
+      {/* Norwegian Singles method primer */}
+      {showMethodModal && (
+        <MethodModal onClose={() => setShowMethodModal(false)} />
+      )}
+
+      {/* Add unscheduled session modal */}
+      {addSessionTarget && plan && (
+        <AddSessionModal
+          plan={plan}
+          weekIdx={addSessionTarget.weekIdx}
+          dayIdx={addSessionTarget.dayIdx}
+          onAdd={(sessionData) => {
+            addUnscheduledSession(addSessionTarget.weekIdx, addSessionTarget.dayIdx, sessionData);
+            setAddSessionTarget(null);
+          }}
+          onClose={() => setAddSessionTarget(null)}
         />
       )}
     </div>
@@ -597,7 +640,347 @@ function NavButton({ icon: Icon, label, active, onClick }) {
   );
 }
 
-function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, hasPlan }) {
+// Modal for logging an unscheduled run or cross-training session on a given day.
+function AddSessionModal({ plan, weekIdx, dayIdx, onAdd, onClose }) {
+  const [type, setType] = useState(null); // 'easy' | 'subT' | 'long' | 'strength' | 'cross'
+  const [miles, setMiles] = useState('');
+  const [crossType, setCrossType] = useState('');
+  const [durationMin, setDurationMin] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const day = plan[weekIdx]?.days[dayIdx];
+  const [y, m, d] = (day?.date || '').split('-').map(Number);
+  const dayName = day?.date ? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(y, m - 1, d).getDay()] : '';
+  const displayDate = day?.date ? `${dayName} ${m}/${d}` : '';
+
+  const typeOptions = [
+    { id: 'easy', label: 'Easy run', icon: Footprints, color: 'emerald' },
+    { id: 'subT', label: 'Sub-T run', icon: TrendingUp, color: 'rose' },
+    { id: 'long', label: 'Long run', icon: Activity, color: 'blue' },
+    { id: 'strength', label: 'Strength', icon: Dumbbell, color: 'purple' },
+    { id: 'cross', label: 'Cross-train', icon: Activity, color: 'cyan' },
+  ];
+
+  const isRun = type === 'easy' || type === 'subT' || type === 'long';
+  const isCross = type === 'cross';
+  const isStrength = type === 'strength';
+
+  const canSave = type !== null && (
+    (isRun && miles.trim() !== '') ||
+    (isCross && crossType.trim() !== '' && durationMin.trim() !== '') ||
+    isStrength
+  );
+
+  const handleSave = () => {
+    if (!canSave) return;
+    const data = { type };
+    const chosen = typeOptions.find(t => t.id === type);
+    if (isRun) {
+      const m = parseFloat(miles);
+      if (!Number.isFinite(m) || m <= 0) return;
+      data.miles = m;
+      data.label = `${chosen.label} · ${m.toFixed(1)} mi`;
+    } else if (isCross) {
+      const dur = parseFloat(durationMin);
+      if (!Number.isFinite(dur) || dur <= 0) return;
+      data.crossType = crossType.trim();
+      data.durationMin = dur;
+      data.label = `${crossType.trim()} · ${dur} min`;
+    } else if (isStrength) {
+      data.label = 'Strength session';
+      if (durationMin.trim()) {
+        const dur = parseFloat(durationMin);
+        if (Number.isFinite(dur) && dur > 0) {
+          data.durationMin = dur;
+          data.label = `Strength · ${dur} min`;
+        }
+      }
+    }
+    if (notes.trim()) data.notes = notes.trim();
+    onAdd(data);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl p-5 max-h-[90vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="text-base font-semibold text-slate-900">Add session</h3>
+            {displayDate && <p className="text-xs text-slate-500 mt-0.5">{displayDate}</p>}
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Session type picker */}
+        <div>
+          <label className="block text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wide">Type</label>
+          <div className="grid grid-cols-2 gap-2">
+            {typeOptions.map(opt => {
+              const Icon = opt.icon;
+              const selected = type === opt.id;
+              const style = SESSION_COLORS[opt.id];
+              return (
+                <button
+                  key={opt.id}
+                  onClick={() => setType(opt.id)}
+                  className={`flex items-center gap-2 p-2.5 rounded-md text-sm font-medium border transition ${
+                    selected
+                      ? `${style.bg} ${style.border} ${style.text} ring-2 ring-offset-1 ring-slate-900`
+                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                  }`}>
+                  <Icon className="h-4 w-4 flex-shrink-0" />
+                  <span>{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Type-specific fields */}
+        {isRun && (
+          <div className="mt-4">
+            <label className="block text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Distance (miles)</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              inputMode="decimal"
+              value={miles}
+              onChange={e => setMiles(e.target.value)}
+              placeholder="e.g. 5.2"
+              className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-500 focus:border-transparent"
+              autoFocus
+            />
+          </div>
+        )}
+
+        {isCross && (
+          <>
+            <div className="mt-4">
+              <label className="block text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Activity</label>
+              <input
+                type="text"
+                value={crossType}
+                onChange={e => setCrossType(e.target.value)}
+                placeholder="e.g. Cycling, Swimming, Yoga"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                autoFocus
+              />
+            </div>
+            <div className="mt-3">
+              <label className="block text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Duration (minutes)</label>
+              <input
+                type="number"
+                step="1"
+                min="0"
+                inputMode="numeric"
+                value={durationMin}
+                onChange={e => setDurationMin(e.target.value)}
+                placeholder="e.g. 45"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+              />
+            </div>
+            <p className="text-[10px] text-slate-500 mt-2 italic">Cross-training won't count toward weekly running mileage, but will appear on your plan.</p>
+          </>
+        )}
+
+        {isStrength && (
+          <div className="mt-4">
+            <label className="block text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Duration (minutes, optional)</label>
+            <input
+              type="number"
+              step="1"
+              min="0"
+              inputMode="numeric"
+              value={durationMin}
+              onChange={e => setDurationMin(e.target.value)}
+              placeholder="e.g. 30"
+              className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+              autoFocus
+            />
+          </div>
+        )}
+
+        {/* Notes */}
+        {type && (
+          <div className="mt-4">
+            <label className="block text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">
+              Notes <span className="font-normal text-slate-400 normal-case">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              maxLength={200}
+              placeholder="How it went, HR, pace, etc."
+              className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-500 focus:border-transparent"
+            />
+          </div>
+        )}
+
+        <div className="mt-5 flex gap-2">
+          <button
+            onClick={onClose}
+            className="flex-1 py-2.5 border border-slate-300 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50">
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={!canSave}
+            className="flex-1 py-2.5 bg-slate-900 text-white rounded-md text-sm font-medium hover:bg-slate-800 disabled:bg-slate-300 disabled:cursor-not-allowed">
+            Add
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Norwegian Singles method primer — written out as a shareable read.
+function MethodModal({ onClose }) {
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-2xl rounded-t-2xl sm:rounded-2xl max-h-[90vh] overflow-hidden flex flex-col"
+        onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex items-center justify-between p-5 border-b border-slate-200 flex-shrink-0">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900">The Norwegian Singles Method</h3>
+            <p className="text-xs text-slate-500 mt-0.5">A primer</p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Content — scrollable */}
+        <div className="overflow-y-auto px-5 py-4 flex-1">
+          <div className="prose prose-sm max-w-none text-slate-700 space-y-4 text-sm leading-relaxed">
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">What it is</h4>
+              <p>
+                The Norwegian Singles method is a running training approach centered on a simple idea: run easy almost all the time, but layer in frequent, moderately-hard workouts called "sub-threshold" sessions. It's called "Singles" because workouts are done once per day — no doubles (two sessions/day) like the elite Norwegian method it's derived from.
+              </p>
+              <p>
+                It was designed by Marius Bakken, a former Norwegian 5K national record holder, and popularized in the running community by a user named Sirpoc on the LetsRun forums, who documented dramatic improvements running 40–60 miles per week on this method.
+              </p>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">The core weekly structure</h4>
+              <p>A typical Singles week looks like:</p>
+              <ul className="list-disc pl-5 space-y-1">
+                <li><strong>2–3 sub-threshold (sub-T) workouts</strong> — intervals run just below lactate threshold, e.g. 5×1 mile at ~10K pace with short recovery</li>
+                <li><strong>1 long run</strong> — at easy pace</li>
+                <li><strong>3–4 easy runs</strong> — strictly below ~70% of max heart rate</li>
+                <li><strong>1 rest day</strong></li>
+              </ul>
+              <p>
+                That's it. No tempo runs. No VO2 max intervals. No race-pace sessions. Just sub-T and easy, repeated week after week.
+              </p>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">What makes it different</h4>
+              <p>
+                Most training philosophies (Daniels, Pfitzinger, Hanson's Marathon Method) include a variety of workout types across multiple intensities: tempo, threshold, VO2, marathon-pace, race-pace, strides, etc. The theory is that each stimulus develops a different physiological system.
+              </p>
+              <p>
+                Singles is radically simpler. It uses <em>one</em> workout intensity — sub-T — and <em>frequently</em>, counting on volume and repetition to drive adaptation rather than variety. This does a few things:
+              </p>
+              <ul className="list-disc pl-5 space-y-1">
+                <li><strong>Reduces injury risk</strong> — fewer high-intensity sessions means less cumulative mechanical stress</li>
+                <li><strong>Improves recovery</strong> — sub-T is easier to recover from than threshold or race-pace, so you can do it 2–3x weekly without digging a fatigue hole</li>
+                <li><strong>Keeps easy runs genuinely easy</strong> — because your hard days aren't wrecking you, you don't need to recovery-jog between them</li>
+                <li><strong>Builds aerobic capacity aggressively</strong> — total volume + moderately hard work accumulates a lot of stimulus without crossing the fatigue line</li>
+              </ul>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">Why "sub-T"?</h4>
+              <p>
+                Lactate threshold (LT2) is the pace/effort at which your body starts accumulating lactate faster than it can clear it. Running at or above LT2 forces a relatively quick end to the effort and requires significant recovery.
+              </p>
+              <p>
+                Sub-T is just below that line — close enough to stimulate adaptation in the lactate-clearing system, but below the tipping point. This means you can do meaningful work, repeat it frequently, and the next day's session isn't compromised.
+              </p>
+              <p>
+                Practically: sub-T is often 10–20 seconds per mile slower than 10K race pace, at a heart rate roughly 84–88% of max. It should feel "comfortably hard" — breathing hard but in rhythm, conversation in short phrases only.
+              </p>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">Why strict easy pace matters</h4>
+              <p>
+                The method only works if easy runs are truly easy. "Easy" in Singles typically means below 70% of max heart rate — slower than most runners naturally drift toward. Running easy at 75–80% of max, even if it feels fine, accumulates enough stress that your sub-T sessions will suffer.
+              </p>
+              <p>
+                This is the hardest part of the method for most runners. You'll feel like you're wasting your run. You're not — you're preserving the ability to execute the hard days at the right quality.
+              </p>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">Who it works well for</h4>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Runners prone to injury from higher-intensity plans</li>
+                <li>Runners who find traditional training too chaotic (different workout type every day)</li>
+                <li>Runners building base fitness from a plateau</li>
+                <li>Runners with limited time — Singles requires less recovery complexity</li>
+              </ul>
+              <p>It's less well-suited for short-distance specialists (1500m and below) who need more speed work.</p>
+            </section>
+
+            <section>
+              <h4 className="font-semibold text-slate-900 text-base mb-2">Further reading</h4>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>
+                  <a href="https://www.mariusbakken.com/the-norwegian-model.html" target="_blank" rel="noopener noreferrer"
+                     className="text-blue-600 hover:text-blue-800 underline">
+                    Marius Bakken — the Norwegian Model
+                  </a> (the original architect's own writeup)
+                </li>
+                <li>
+                  <a href="https://www.letsrun.com/forum/flat_read.php?thread=11459409" target="_blank" rel="noopener noreferrer"
+                     className="text-blue-600 hover:text-blue-800 underline">
+                    Sirpoc's LetsRun thread
+                  </a> (the training log that popularized Singles)
+                </li>
+                <li>
+                  <a href="https://scientifictriathlon.com/" target="_blank" rel="noopener noreferrer"
+                     className="text-blue-600 hover:text-blue-800 underline">
+                    Scientific Triathlon — Norwegian Method podcasts
+                  </a> (Mikael Eriksson's interviews with the Ingebrigtsens' coaches)
+                </li>
+              </ul>
+            </section>
+
+            <p className="text-xs text-slate-500 italic pt-2 border-t border-slate-100">
+              This primer is a simplification. The actual method has more nuance — periodization, how to progress sub-T pace over time, how to recover from workouts that don't go well, etc. The resources above go deeper.
+            </p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="p-4 border-t border-slate-200 flex-shrink-0 bg-slate-50">
+          <button onClick={onClose}
+            className="w-full py-2 bg-slate-900 text-white rounded-md text-sm font-medium hover:bg-slate-800">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, hasPlan, onShowMethod }) {
   const update = (patch) => onChange({ ...setup, ...patch });
   const toggleQualityDay = (d) => {
     const has = setup.qualityDays.includes(d);
@@ -727,6 +1110,19 @@ function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, 
         )}
       </div>
 
+      {/* About the method */}
+      <div className="mt-8 pt-5 border-t border-slate-200">
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">About the Norwegian Singles method</h3>
+        <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+          A primer on how this training approach works and how it differs from more common plans like Daniels or Pfitzinger. Shareable with friends who are curious.
+        </p>
+        <button onClick={onShowMethod}
+          className="w-full sm:w-auto px-4 py-2 bg-slate-100 text-slate-800 border border-slate-200 rounded-md font-medium text-sm hover:bg-slate-200 transition flex items-center justify-center gap-1.5">
+          <Info className="h-3.5 w-3.5" />
+          Read the primer
+        </button>
+      </div>
+
       {/* Backup & restore section */}
       <div className="mt-8 pt-5 border-t border-slate-200">
         <h3 className="text-sm font-semibold text-slate-900 mb-1">Backup & restore</h3>
@@ -753,6 +1149,8 @@ function SetupForm({ setup, onChange, onGenerate, onReset, onBackup, onRestore, 
 function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelected, isMovableInMode, onSelectAsMoveTarget, onClick }) {
   const style = SESSION_COLORS[session.type] || SESSION_COLORS.easy;
   const Icon = style.icon;
+  // Unscheduled sessions use `label` (user-entered), planned ones use `title`
+  const displayTitle = session.title || session.label || 'Session';
 
   const handleCardClick = (e) => {
     // In move mode, tapping does nothing on the card itself (the whole day handles the tap)
@@ -767,7 +1165,7 @@ function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelec
         completed ? 'opacity-60' : ''
       } ${isSelected ? 'ring-2 ring-slate-900 shadow-lg' : ''} ${
         isMoveMode && !isSelected ? 'opacity-50' : ''
-      }`}
+      } ${session.unscheduled ? 'border-dashed' : ''}`}
     >
       <div className="flex items-start gap-2">
         <button
@@ -784,14 +1182,20 @@ function SessionCard({ session, completed, onToggle, hasLog, isMoveMode, isSelec
           <div className="flex items-center gap-1.5 mb-0.5">
             <Icon className={`h-3.5 w-3.5 ${style.text} flex-shrink-0`} />
             <p className={`text-xs font-semibold ${style.text} leading-tight truncate ${completed ? 'line-through' : ''}`}>
-              {session.title}
+              {displayTitle}
             </p>
             {hasLog && (
               <span className="ml-auto text-[9px] font-bold text-emerald-700 bg-emerald-100 rounded px-1 py-0.5 flex-shrink-0">LOGGED</span>
             )}
+            {session.unscheduled && !hasLog && (
+              <span className="ml-auto text-[8px] font-semibold text-slate-500 bg-slate-100 rounded px-1 py-0.5 flex-shrink-0">EXTRA</span>
+            )}
           </div>
           {session.pace && (
             <p className="text-[10px] text-slate-600 leading-tight">{session.pace} · {session.hr}</p>
+          )}
+          {session.unscheduled && session.notes && (
+            <p className="text-[10px] text-slate-500 leading-tight italic truncate">{session.notes}</p>
           )}
         </div>
       </div>
@@ -964,6 +1368,7 @@ function PainSection({ painLog, onOpenPainModal }) {
 function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
   const today = todayISO();
   const [editing, setEditing] = useState(false);
+  const [addingNew, setAddingNew] = useState(false);
   const [newExerciseName, setNewExerciseName] = useState('');
   const [newExerciseNote, setNewExerciseNote] = useState('');
 
@@ -982,6 +1387,7 @@ function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
     }));
     setNewExerciseName('');
     setNewExerciseNote('');
+    setAddingNew(false);
   };
 
   const handleRemove = (id) => {
@@ -992,66 +1398,65 @@ function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
     }));
   };
 
+  // Empty state — no exercises configured yet
+  if (exercises.length === 0 && !addingNew) {
+    return (
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Rehab exercises</h3>
+        </div>
+        <div className="bg-slate-50 border border-dashed border-slate-300 rounded-lg p-4 text-center">
+          <Dumbbell className="h-5 w-5 text-slate-400 mx-auto mb-1.5" />
+          <p className="text-xs text-slate-600 mb-2">Add PT-prescribed exercises to track consistency.</p>
+          <button
+            onClick={() => setAddingNew(true)}
+            className="text-[11px] text-purple-600 hover:text-purple-700 font-medium inline-flex items-center gap-1">
+            <Plus className="h-3 w-3" />
+            Add exercise
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Rehab / Strength</h3>
-        <button
-          onClick={() => setEditing(!editing)}
-          className="text-[11px] text-slate-600 hover:text-slate-900 underline underline-offset-2">
-          {editing ? 'Done editing' : 'Edit list'}
-        </button>
+        <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Rehab exercises</h3>
+        <div className="flex items-center gap-3">
+          <span className="text-[11px] text-slate-600">
+            {done}/{total} today{stats.streak >= 2 ? ` · ${stats.streak}d streak` : ''}
+          </span>
+          <button
+            onClick={() => { setEditing(!editing); setAddingNew(false); }}
+            className="text-[11px] text-slate-600 hover:text-slate-900 underline underline-offset-2">
+            {editing ? 'Done' : 'Edit'}
+          </button>
+        </div>
       </div>
 
-      {/* Today header */}
-      <div className="bg-white border border-slate-200 rounded-lg p-3 mb-3">
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <span className="text-[10px] text-slate-500 uppercase tracking-wide">Today</span>
-            <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-xl font-semibold text-slate-900">{done}/{total}</span>
-              <span className="text-xs text-slate-500">done</span>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            {stats.streak >= 2 && (
-              <span className="text-[11px] font-semibold text-purple-700 bg-purple-50 rounded px-2 py-0.5">
-                {stats.streak}d streak
-              </span>
-            )}
-            {stats.daysDone7 >= 1 && (
-              <span className="text-[11px] text-slate-600">
-                {stats.daysDone7}/7 days this week
-              </span>
-            )}
-          </div>
-        </div>
-
+      <div className="bg-white border border-slate-200 rounded-lg p-3">
         {/* Exercise checklist */}
-        {exercises.length === 0 ? (
-          <p className="text-xs text-slate-500 text-center py-4">
-            No exercises yet. Tap "Edit list" to add the ones your PT prescribed.
-          </p>
-        ) : (
+        {exercises.length > 0 && (
           <div className="space-y-1.5">
             {exercises.map(ex => {
-              const done = wasExerciseDone(rehabLog, today, ex.id);
+              const isDone = wasExerciseDone(rehabLog, today, ex.id);
               return (
                 <div key={ex.id} className="flex items-center gap-2">
                   <button
                     onClick={() => !editing && onToggleRehab(ex.id)}
                     disabled={editing}
                     className={`flex items-center gap-2 flex-1 text-left p-2 rounded-md border transition ${
-                      done
+                      isDone
                         ? 'bg-purple-50 border-purple-200 text-purple-900'
                         : 'bg-white border-slate-200 hover:border-slate-300'
                     } ${editing ? 'opacity-60 cursor-not-allowed' : ''}`}>
-                    {done
+                    {isDone
                       ? <CheckCircle2 className="h-4 w-4 text-purple-600 flex-shrink-0" />
                       : <Circle className="h-4 w-4 text-slate-400 flex-shrink-0" />
                     }
                     <div className="min-w-0 flex-1">
-                      <p className={`text-sm font-medium truncate ${done ? 'line-through text-purple-900/70' : 'text-slate-900'}`}>
+                      <p className={`text-sm font-medium truncate ${isDone ? 'line-through text-purple-900/70' : 'text-slate-900'}`}>
                         {ex.name}
                       </p>
                       {ex.note && (
@@ -1073,9 +1478,9 @@ function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
           </div>
         )}
 
-        {/* Add form shown while editing */}
-        {editing && (
-          <div className="mt-3 pt-3 border-t border-slate-100">
+        {/* Add-new form (shown when editing OR when Add is tapped from empty state) */}
+        {(editing || addingNew) && (
+          <div className={exercises.length > 0 ? "mt-3 pt-3 border-t border-slate-100" : ""}>
             <div className="space-y-2">
               <input
                 type="text"
@@ -1091,52 +1496,61 @@ function RehabSection({ config, rehabLog, onToggleRehab, onUpdateConfig }) {
                 placeholder="Prescription (e.g. 3x15 each side) — optional"
                 className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
               />
-              <button
-                onClick={handleAdd}
-                disabled={!newExerciseName.trim()}
-                className="w-full py-2 bg-purple-600 text-white rounded-md text-sm font-medium hover:bg-purple-700 disabled:bg-slate-300 disabled:cursor-not-allowed flex items-center justify-center gap-1">
-                <Plus className="h-4 w-4" />
-                Add exercise
-              </button>
+              <div className="flex gap-2">
+                {addingNew && exercises.length === 0 && (
+                  <button
+                    onClick={() => { setAddingNew(false); setNewExerciseName(''); setNewExerciseNote(''); }}
+                    className="flex-1 py-2 border border-slate-300 rounded-md text-sm text-slate-700 hover:bg-slate-50">
+                    Cancel
+                  </button>
+                )}
+                <button
+                  onClick={handleAdd}
+                  disabled={!newExerciseName.trim()}
+                  className="flex-1 py-2 bg-purple-600 text-white rounded-md text-sm font-medium hover:bg-purple-700 disabled:bg-slate-300 disabled:cursor-not-allowed inline-flex items-center justify-center gap-1">
+                  <Plus className="h-4 w-4" />
+                  Add
+                </button>
+              </div>
             </div>
           </div>
         )}
       </div>
 
-      {/* Consistency grid: last 14 days */}
-      {exercises.length > 0 && (
-        <div className="bg-white border border-slate-200 rounded-lg p-3">
+      {/* Consistency grid: last 14 days — only shown once there's data */}
+      {exercises.length > 0 && stats.daysDone14 > 0 && (
+        <div className="bg-white border border-slate-200 rounded-lg p-3 mt-3">
           <h4 className="text-[10px] font-semibold text-slate-600 uppercase tracking-wide mb-2">Last 14 days</h4>
           <div className="flex gap-1">
-            {grid.map((day, i) => {
+            {grid.map((day) => {
               const pct = exercises.length > 0 ? day.count / exercises.length : 0;
               const bg = day.count === 0 ? 'bg-slate-100'
                 : pct >= 1 ? 'bg-purple-600'
                 : pct >= 0.5 ? 'bg-purple-400'
                 : 'bg-purple-200';
-              const [mm, dd] = day.date.slice(5).split('-');
+              const [, dd] = day.date.slice(5).split('-');
               return (
                 <div
                   key={day.date}
                   className="flex-1 flex flex-col items-center"
                   title={`${day.date}: ${day.count}/${exercises.length}`}>
-                  <div className={`w-full h-8 rounded ${bg}`} />
-                  <span className="text-[8px] text-slate-400 mt-1">{Number(dd)}</span>
+                  <div className={`w-full h-6 rounded ${bg}`} />
+                  <span className="text-[8px] text-slate-400 mt-0.5">{Number(dd)}</span>
                 </div>
               );
             })}
           </div>
-          <div className="flex items-center justify-between mt-3 text-[10px] text-slate-500">
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1">
+          <div className="flex items-center justify-between mt-2 text-[10px] text-slate-500">
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-0.5">
                 <div className="w-2 h-2 rounded bg-slate-100" />
                 <span>None</span>
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-0.5">
                 <div className="w-2 h-2 rounded bg-purple-200" />
                 <span>Partial</span>
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-0.5">
                 <div className="w-2 h-2 rounded bg-purple-600" />
                 <span>All</span>
               </div>
@@ -1250,24 +1664,72 @@ function PainChart({ painLog }) {
 }
 
 // Modal for entering pain ratings
-function PainModal({ date, mode, existingEntry, painLog, onSave, onClose }) {
+function PainModal({ date, mode, painLog, onSave, onClose }) {
+  // Track the date internally so arrows can navigate without closing the modal
+  const [currentDate, setCurrentDate] = useState(date);
+  const today = todayISO();
+
+  // Re-derive initial values whenever the date changes
+  const existingEntry = getEntryForDate(painLog, currentDate);
   const initial = existingEntry || {};
   const [morningPain, setMorningPain] = useState(initial.morningPain ?? null);
   const [deskPain, setDeskPain] = useState(initial.deskPain ?? null);
   const [postRunPain, setPostRunPain] = useState(initial.postRunPain ?? null);
   const [note, setNote] = useState(initial.note || '');
 
-  const handleSave = () => {
+  // When the currentDate changes (via nav arrows), reload the fields from that day's entry
+  useEffect(() => {
+    const entry = getEntryForDate(painLog, currentDate) || {};
+    setMorningPain(entry.morningPain ?? null);
+    setDeskPain(entry.deskPain ?? null);
+    setPostRunPain(entry.postRunPain ?? null);
+    setNote(entry.note || '');
+  }, [currentDate, painLog]);
+
+  const buildUpdates = () => {
     const updates = {};
     if (morningPain !== null) updates.morningPain = morningPain;
     if (deskPain !== null) updates.deskPain = deskPain;
     if (postRunPain !== null) updates.postRunPain = postRunPain;
     if (note.trim()) updates.note = note.trim();
-    onSave(updates);
+    return updates;
   };
 
-  const [y, m, d] = date.split('-').map(Number);
-  const displayDate = `${m}/${d}/${y}`;
+  const hasAnyValue = morningPain !== null || deskPain !== null || postRunPain !== null || note.trim().length > 0;
+
+  const handleSave = () => {
+    onSave(currentDate, buildUpdates());
+  };
+
+  // Navigate to another day, auto-saving current entry if it has values
+  const navigateToDate = (newDate) => {
+    if (hasAnyValue) {
+      // Save current day's entries before navigating
+      onSave(currentDate, buildUpdates(), { keepOpen: true });
+    }
+    setCurrentDate(newDate);
+  };
+
+  const shiftDay = (delta) => {
+    const [y, m, d] = currentDate.split('-').map(Number);
+    const date = new Date(y, m - 1, d);
+    date.setDate(date.getDate() + delta);
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    navigateToDate(`${yyyy}-${mm}-${dd}`);
+  };
+
+  const [y, m, d] = currentDate.split('-').map(Number);
+  const isToday_ = currentDate === today;
+  const dateObj = new Date(y, m - 1, d);
+  const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dateObj.getDay()];
+  const displayDate = isToday_
+    ? `Today · ${m}/${d}`
+    : `${dayName} · ${m}/${d}/${y}`;
+
+  // Disable forward arrow if we're already at today
+  const canGoForward = !isToday_;
 
   return (
     <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
@@ -1275,18 +1737,34 @@ function PainModal({ date, mode, existingEntry, painLog, onSave, onClose }) {
       <div
         className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl p-5 max-h-[90vh] overflow-y-auto"
         onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h3 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
-              <Heart className="h-4 w-4 text-rose-600" />
-              Knee pain · {displayDate}
-            </h3>
-            <p className="text-xs text-slate-500 mt-0.5">Rate 0 (none) to 10 (worst imaginable)</p>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Heart className="h-4 w-4 text-rose-600" />
+            <h3 className="text-base font-semibold text-slate-900">Knee pain</h3>
           </div>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1">
             <X className="h-5 w-5" />
           </button>
         </div>
+
+        {/* Date navigation */}
+        <div className="flex items-center justify-between mb-4 bg-slate-50 rounded-md p-1">
+          <button
+            onClick={() => shiftDay(-1)}
+            className="p-1.5 rounded hover:bg-white text-slate-600 hover:text-slate-900"
+            title="Previous day">
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <div className="text-sm font-medium text-slate-700">{displayDate}</div>
+          <button
+            onClick={() => shiftDay(1)}
+            disabled={!canGoForward}
+            className="p-1.5 rounded hover:bg-white text-slate-600 hover:text-slate-900 disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Next day">
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mb-4">Rate 0 (none) to 10 (worst imaginable)</p>
 
         <div className="space-y-4">
           <PainSlider
@@ -1396,7 +1874,7 @@ function PainSlider({ label, sublabel, value, onChange, optional }) {
   );
 }
 
-function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick }) {
+function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick, onAddSessionRequest }) {
   // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
   const [moveSelection, setMoveSelection] = useState(null);
   const week = plan[currentWeekIdx];
@@ -1552,6 +2030,16 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, 
               {isMoveTarget && day.sessions.length === 0 && (
                 <p className="text-xs text-emerald-700 italic text-center py-2">Drop here</p>
               )}
+              {/* Add unscheduled session button (hidden in move mode) */}
+              {!isMoveMode && onAddSessionRequest && (
+                <button
+                  onClick={() => onAddSessionRequest(idx)}
+                  className="mt-1.5 w-full text-[10px] text-slate-400 hover:text-slate-700 hover:bg-slate-50 rounded py-1 px-2 border border-dashed border-slate-200 hover:border-slate-300 flex items-center justify-center gap-1 transition"
+                  title="Log an unscheduled session">
+                  <Plus className="h-3 w-3" />
+                  <span>Add session</span>
+                </button>
+              )}
             </div>
           );
         })}
@@ -1612,7 +2100,7 @@ function ArcView({ plan, completions, onJumpToWeek }) {
 }
 
 function buildSummaryText(session) {
-  const lines = [session.title];
+  const lines = [session.title || session.label || 'Session'];
   if (session.pace) lines.push(`Target pace: ${session.pace}`);
   if (session.hr) lines.push(`Target HR: ${session.hr}`);
   if (session.detail) {
@@ -1801,7 +2289,7 @@ function SessionModal({ session, onMoveStart, sessionKey, log, onSaveLog, paces,
       <div className="bg-white rounded-t-2xl sm:rounded-xl max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="p-5">
           <div className="flex items-start justify-between gap-3 mb-3">
-            <h3 className="font-semibold text-lg">{session.title}</h3>
+            <h3 className="font-semibold text-lg">{session.title || session.label || 'Session'}</h3>
             <button onClick={onClose} className="text-slate-400 text-2xl leading-none">×</button>
           </div>
 
@@ -2244,13 +2732,42 @@ function ForecastCard({ forecast }) {
 }
 
 function OutfitCard({ outfit, forecast, onFeedback }) {
-  const { items, effectiveTempF, band, bias, rainAdjusted } = outfit;
+  const { items, effectiveTempF, band, bias, rainAdjusted, topAlternatives } = outfit;
+  // Track 2-step feedback flow for ambiguous-top bands
+  // null = feedback closed; 'choosing' = asking which they wore; then final: applies shift
+  const [pendingFeedback, setPendingFeedback] = useState(null); // { feedback: 'too-cold', ... }
+
   const sections = [
     { label: 'Top', items: items.top, icon: Shirt },
     { label: 'Bottom', items: items.bottom, icon: null },
     { label: 'Head', items: items.head, icon: null },
     { label: 'Hands', items: items.hands, icon: null },
   ].filter(s => s.items.length > 0);
+
+  const handleFeedbackClick = (feedback) => {
+    if (topAlternatives) {
+      // Ambiguous top: ask which option they wore before applying
+      setPendingFeedback(feedback);
+    } else {
+      onFeedback(band, feedback);
+    }
+  };
+
+  const handleWornChoice = (wornKey) => {
+    // wornKey is topAlternatives.primary or topAlternatives.secondary
+    const wore = wornKey === topAlternatives.primary ? 'primary'
+      : wornKey === topAlternatives.primary === 'tank' || wornKey === 'ls' ? 'warmer'
+      : null;
+    // Simpler: determine 'cooler'/'warmer' based on key — LS > T-shirt > tank
+    const warmthRank = { ls: 2, tshirt: 1, tank: 0 };
+    const wornRank = warmthRank[wornKey];
+    const primaryRank = warmthRank[topAlternatives.primary];
+    const contextWore = wornRank > primaryRank ? 'warmer'
+      : wornRank < primaryRank ? 'cooler'
+      : 'primary';
+    onFeedback(band, pendingFeedback, { wore: contextWore });
+    setPendingFeedback(null);
+  };
 
   return (
     <div className="bg-white rounded-lg border border-slate-200 p-4">
@@ -2289,34 +2806,63 @@ function OutfitCard({ outfit, forecast, onFeedback }) {
         )}
       </div>
 
-      {/* Feedback buttons */}
+      {/* Feedback section */}
       <div className="border-t border-slate-100 pt-3">
-        <p className="text-xs text-slate-500 mb-2">After your run, how was this dressing recommendation?</p>
-        <div className="grid grid-cols-2 gap-2">
-          <button onClick={() => onFeedback(band, 'way-too-cold')}
-            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded-md text-xs font-medium transition">
-            <ThermometerSnowflake className="h-3.5 w-3.5" />
-            Way too cold
-          </button>
-          <button onClick={() => onFeedback(band, 'way-too-hot')}
-            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-100 hover:bg-orange-200 text-orange-900 rounded-md text-xs font-medium transition">
-            <ThermometerSun className="h-3.5 w-3.5" />
-            Way too hot
-          </button>
-          <button onClick={() => onFeedback(band, 'too-cold')}
-            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-md text-xs font-medium transition">
-            <ThermometerSnowflake className="h-3.5 w-3.5" />
-            A bit cold
-          </button>
-          <button onClick={() => onFeedback(band, 'too-hot')}
-            className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-50 hover:bg-orange-100 text-orange-800 rounded-md text-xs font-medium transition">
-            <ThermometerSun className="h-3.5 w-3.5" />
-            A bit hot
-          </button>
-        </div>
-        <p className="text-[10px] text-slate-400 mt-2 italic leading-snug">
-          Feedback adjusts the {band} band only ({band === 'cold' ? '<40°F' : band === 'cool' ? '40–60°F' : band === 'warm' ? '60–75°F' : '>75°F'}). Your other bands are unchanged.
-        </p>
+        {pendingFeedback && topAlternatives ? (
+          // Step 2: ask which option was worn
+          <div>
+            <p className="text-xs text-slate-700 mb-2 font-medium">
+              Which top did you wear?
+            </p>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <button
+                onClick={() => handleWornChoice(topAlternatives.primary)}
+                className="px-2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-900 rounded-md text-xs font-medium transition">
+                {topAlternatives.primaryLabel}
+              </button>
+              <button
+                onClick={() => handleWornChoice(topAlternatives.secondary)}
+                className="px-2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-900 rounded-md text-xs font-medium transition">
+                {topAlternatives.secondaryLabel}
+              </button>
+            </div>
+            <button
+              onClick={() => setPendingFeedback(null)}
+              className="text-[10px] text-slate-400 hover:text-slate-600">
+              ← back
+            </button>
+          </div>
+        ) : (
+          // Step 1: how did it feel?
+          <>
+            <p className="text-xs text-slate-500 mb-2">After your run, how was this dressing recommendation?</p>
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => handleFeedbackClick('way-too-cold')}
+                className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded-md text-xs font-medium transition">
+                <ThermometerSnowflake className="h-3.5 w-3.5" />
+                Way too cold
+              </button>
+              <button onClick={() => handleFeedbackClick('way-too-hot')}
+                className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-100 hover:bg-orange-200 text-orange-900 rounded-md text-xs font-medium transition">
+                <ThermometerSun className="h-3.5 w-3.5" />
+                Way too hot
+              </button>
+              <button onClick={() => handleFeedbackClick('too-cold')}
+                className="flex items-center justify-center gap-1.5 px-2 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-md text-xs font-medium transition">
+                <ThermometerSnowflake className="h-3.5 w-3.5" />
+                A bit cold
+              </button>
+              <button onClick={() => handleFeedbackClick('too-hot')}
+                className="flex items-center justify-center gap-1.5 px-2 py-2 bg-orange-50 hover:bg-orange-100 text-orange-800 rounded-md text-xs font-medium transition">
+                <ThermometerSun className="h-3.5 w-3.5" />
+                A bit hot
+              </button>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-2 italic leading-snug">
+              Feedback adjusts the {band} band only ({band === 'cold' ? '<40°F' : band === 'cool' ? '40–60°F' : band === 'warm' ? '60–75°F' : '>75°F'}). Your other bands are unchanged.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

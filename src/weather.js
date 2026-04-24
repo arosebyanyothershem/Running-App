@@ -229,17 +229,37 @@ export function recommendOutfit(weather, options = {}) {
   const items = { top: [], bottom: [], head: [], hands: [], extras: [] };
 
   // ============ TOP ============
-  // Sources: Tina Muir, dressmyrun, publication consensus
+  // Sources: Tina Muir, dressmyrun, publication consensus.
+  // Ambiguous bands (where either option is reasonable) are exposed as
+  // `topAlternatives` so the UI can ask the user which they wore when
+  // giving feedback. The primary recommendation still goes into items.top[0].
+  let topAlternatives = null;
   if (effTemp >= 90) {
     items.top.push('Tank or singlet (lightweight, moisture-wicking)');
   } else if (effTemp >= 80) {
     items.top.push('Tank or singlet (lightweight, moisture-wicking)');
   } else if (effTemp >= 65) {
-    items.top.push('Technical T-shirt or tank (personal preference)');
+    // 65–80°F: tank OR T-shirt both acceptable
+    // Default to T-shirt at the cool end of the range, tank at the warm end
+    if (effTemp >= 72) {
+      items.top.push('Tank or singlet');
+      topAlternatives = { primary: 'tank', secondary: 'tshirt', primaryLabel: 'Tank/singlet', secondaryLabel: 'Technical T-shirt' };
+    } else {
+      items.top.push('Technical T-shirt');
+      topAlternatives = { primary: 'tshirt', secondary: 'tank', primaryLabel: 'Technical T-shirt', secondaryLabel: 'Tank/singlet' };
+    }
   } else if (effTemp >= 55) {
     items.top.push('Technical T-shirt');
   } else if (effTemp >= 45) {
-    items.top.push('Long-sleeve or T-shirt (personal preference)');
+    // 45–55°F: LS OR T-shirt both defensible
+    // Default to LS at the cool end, T-shirt at the warm end
+    if (effTemp >= 50) {
+      items.top.push('Technical T-shirt');
+      topAlternatives = { primary: 'tshirt', secondary: 'ls', primaryLabel: 'Technical T-shirt', secondaryLabel: 'Long-sleeve shirt' };
+    } else {
+      items.top.push('Long-sleeve shirt');
+      topAlternatives = { primary: 'ls', secondary: 'tshirt', primaryLabel: 'Long-sleeve shirt', secondaryLabel: 'Technical T-shirt' };
+    }
   } else if (effTemp >= 40) {
     items.top.push('Long-sleeve technical shirt');
   } else if (effTemp >= 32) {
@@ -315,10 +335,31 @@ export function recommendOutfit(weather, options = {}) {
     }
   }
 
-  // Wind callout (feels-like already accounts for wind chill, but high winds deserve mention)
-  if (wind >= 20) {
-    items.extras.push(`Wind ${Math.round(wind)} mph — run into the wind first, with it on the way back`);
+  // Wind callouts — tiered by speed, with temperature-aware messaging.
+  // (Wind chill is already baked into feelsLikeF via NWS formula.)
+  // Sources: running publication consensus + common route-planning advice.
+  //   <10 mph  : negligible, no mention
+  //   10-15    : negligible for running
+  //   15-20    : moderate — cold weather: shell; any: plan into-wind-first
+  //   20-30    : strong — add shell if cool; definite into-wind-first
+  //   30+      : dangerous — consider rescheduling
+  const windRounded = Math.round(wind);
+  if (wind >= 30) {
+    items.extras.push(`Dangerous wind (${windRounded} mph) — consider rescheduling, running indoors, or a sheltered route`);
+  } else if (wind >= 20) {
+    if (effTemp < 50) {
+      items.extras.push(`Strong wind (${windRounded} mph) — add a wind-blocking shell; run into the wind first, tailwind home`);
+    } else {
+      items.extras.push(`Strong wind (${windRounded} mph) — run into the wind first, tailwind home`);
+    }
+  } else if (wind >= 15) {
+    if (effTemp < 50) {
+      items.extras.push(`Moderate wind (${windRounded} mph) — consider a wind shell; run into the wind first`);
+    } else {
+      items.extras.push(`Moderate wind (${windRounded} mph) — run into the wind first`);
+    }
   }
+  // Below 15 mph: no wind callout (already factored into feels-like for cold)
 
   // Heat warnings
   if (effTemp >= 85 && effTemp < 90) {
@@ -333,7 +374,7 @@ export function recommendOutfit(weather, options = {}) {
     items.extras.push('Cover exposed skin — frostbite risk in sub-freezing conditions with any wind');
   }
 
-  return { items, effectiveTempF: Math.round(effTemp), band, bias, rainAdjusted: rainAdjustment !== 0 };
+  return { items, effectiveTempF: Math.round(effTemp), band, bias, rainAdjusted: rainAdjustment !== 0, topAlternatives };
 }
 
 // Apply user feedback to update the bias for the relevant temperature band.
@@ -346,15 +387,52 @@ export function recommendOutfit(weather, options = {}) {
 //   'way-too-hot'  → +7°F shift (dress me much cooler)
 //
 // Caps each band's bias at ±20°F to prevent runaway from repeated taps.
-export function applyFeedback(biases, band, feedback) {
+// Apply dressing feedback to the bias table.
+//
+// `feedback` is one of 'way-too-cold', 'too-cold', 'too-hot', 'way-too-hot'.
+//   'way-too-cold' → -7°F shift (dress me much warmer)
+//   'too-cold'     → -3°F shift (dress me a bit warmer)
+//   'too-hot'      → +3°F shift (dress me a bit cooler)
+//   'way-too-hot'  → +7°F shift (dress me much cooler)
+//
+// For ambiguous-top bands (e.g. "LS or T-shirt" at 45–55°F, "T-shirt or tank"
+// at 65–80°F), the optional `context` specifies which option the user actually
+// wore: { wore: 'cooler' | 'warmer' | 'primary' }. This sharpens the signal:
+//   - wore cooler + too-cold  → amplify (they really underdressed)
+//   - wore warmer + too-hot   → amplify (they really overdressed)
+//   - wore cooler + too-hot   → dampen (normal-option wore warmer might have been fine)
+//   - wore warmer + too-cold  → dampen
+//
+// Caps each band's bias at ±20°F to prevent runaway from repeated taps.
+export function applyFeedback(biases, band, feedback, context = null) {
   const shifts = {
     'way-too-cold': -7,
     'too-cold': -3,
     'too-hot': 3,
     'way-too-hot': 7,
   };
-  const delta = shifts[feedback];
+  let delta = shifts[feedback];
   if (delta === undefined) return biases;
+
+  // Adjust based on which option was worn for ambiguous-top bands
+  if (context && context.wore) {
+    const wantedWarmer = feedback === 'too-cold' || feedback === 'way-too-cold';
+    const wantedCooler = feedback === 'too-hot' || feedback === 'way-too-hot';
+    if (context.wore === 'cooler' && wantedWarmer) {
+      // Wore the cooler option, felt cold → amplify (+50%)
+      delta = Math.round(delta * 1.5);
+    } else if (context.wore === 'warmer' && wantedCooler) {
+      // Wore the warmer option, felt hot → amplify (+50%)
+      delta = Math.round(delta * 1.5);
+    } else if (context.wore === 'cooler' && wantedCooler) {
+      // Wore cooler, felt hot — mild signal, dampen (−50%)
+      delta = Math.round(delta * 0.5);
+    } else if (context.wore === 'warmer' && wantedWarmer) {
+      // Wore warmer, felt cold — mild signal, dampen (−50%)
+      delta = Math.round(delta * 0.5);
+    }
+  }
+
   const current = biases[band] || 0;
   const next = Math.max(-20, Math.min(20, current + delta));
   return { ...biases, [band]: next };

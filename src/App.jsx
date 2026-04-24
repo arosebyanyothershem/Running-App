@@ -1259,7 +1259,7 @@ function PainSection({ painLog, onOpenPainModal }) {
           <button
             onClick={() => onOpenPainModal('daily')}
             className="text-[11px] text-slate-600 hover:text-slate-900 underline underline-offset-2">
-            Edit today
+            Edit
           </button>
         )}
       </div>
@@ -1874,6 +1874,19 @@ function PainSlider({ label, sublabel, value, onChange, optional }) {
   );
 }
 
+// Sum miles from unscheduled runs in a week. Cross-training is excluded.
+function extraRunMiles(week) {
+  let extra = 0;
+  for (const day of week.days || []) {
+    for (const s of day.sessions || []) {
+      if (s.unscheduled && (s.type === 'easy' || s.type === 'subT' || s.type === 'long') && typeof s.miles === 'number') {
+        extra += s.miles;
+      }
+    }
+  }
+  return extra;
+}
+
 function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, onToggleCompletion, onMoveSession, onSessionClick, onAddSessionRequest }) {
   // Move-mode state: { fromDay, sessionId } when a session has been selected for moving
   const [moveSelection, setMoveSelection] = useState(null);
@@ -1925,7 +1938,13 @@ function WeekView({ plan, currentWeekIdx, setCurrentWeekIdx, completions, logs, 
             )}
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            {week.phase} · {week.totalMiles} mi · {doneCount}/{totalCount} done
+            {week.phase} · {(() => {
+              const extra = extraRunMiles(week);
+              if (extra > 0) {
+                return `${(week.totalMiles + extra).toFixed(extra % 1 === 0 ? 0 : 1)} mi (${week.totalMiles} planned + ${extra.toFixed(extra % 1 === 0 ? 0 : 1)} extra)`;
+              }
+              return `${week.totalMiles} mi`;
+            })()} · {doneCount}/{totalCount} done
           </p>
         </div>
         <button onClick={() => setCurrentWeekIdx(Math.min(plan.length - 1, currentWeekIdx + 1))}
@@ -2082,7 +2101,15 @@ function ArcView({ plan, completions, onJumpToWeek }) {
                     <p className="font-semibold text-sm truncate">{week.phase}</p>
                     {week.isStepback && <span className="text-[9px] font-bold text-amber-700 bg-amber-100 rounded px-1 py-0.5">STEP-BACK</span>}
                   </div>
-                  <p className="text-xs text-slate-500">{week.totalMiles} mi · {week.subTcount} sub-T</p>
+                  <p className="text-xs text-slate-500">
+                    {(() => {
+                      const extra = extraRunMiles(week);
+                      const total = week.totalMiles + extra;
+                      return extra > 0
+                        ? `${total.toFixed(total % 1 === 0 ? 0 : 1)} mi (+${extra.toFixed(extra % 1 === 0 ? 0 : 1)})`
+                        : `${week.totalMiles} mi`;
+                    })()} · {week.subTcount} sub-T
+                  </p>
                 </div>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">

@@ -132,12 +132,7 @@ export function painLogToCSV(painLog) {
 //   { [dateISO]: { [exerciseId]: true } }  — missing exercises = not done
 
 export const DEFAULT_REHAB_CONFIG = {
-  exercises: [
-    { id: 'sl-leg-raise', name: 'Side-lying leg raises (right)', note: '30 reps' },
-    { id: 'clamshells', name: 'Clamshells with band (right)', note: '30 reps' },
-    { id: 'sl-bridge', name: 'Single-leg glute bridges', note: '2x10 each side' },
-    { id: 'wall-sit', name: 'Wall sit with band outward press', note: '3x30s' },
-  ],
+  exercises: [],
   createdAt: new Date().toISOString(),
 };
 

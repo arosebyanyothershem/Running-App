@@ -4,7 +4,7 @@ import {
   Activity, Dumbbell, Footprints, TrendingUp, RotateCcw, AlertCircle,
   GripVertical, Sunrise, Zap, Download, Watch, Share2, Info, Copy,
   Cloud, MapPin, Wind, Droplets, Shirt, ThermometerSun, ThermometerSnowflake,
-  Heart, X, TrendingDown, Minus, Plus, Trash2, SkipForward,
+  Heart, X, TrendingDown, Minus, Plus, Trash2, SkipForward, RefreshCw, Link2,
 } from 'lucide-react';
 
 import { storage } from './storage.js';
@@ -15,6 +15,10 @@ import {
   estimateRepTime, checkRepTolerance, buildSubTSession,
 } from './planLogic.js';
 import { downloadICS } from './icsExport.js';
+import {
+  mergeStravaActivities, describeSummary, decodeConnectionCode, fetchStravaStatus,
+  ensureFreshAuth, fetchActivitiesSince, deauthorizeStrava,
+} from './stravaSync.js';
 import { downloadTCX } from './tcxExport.js';
 import { geocodeZip, fetchForecast, pickHour, describeWeather, compassFromDeg, recommendOutfit, applyFeedback, getBandForTemp, EMPTY_BIASES } from './weather.js';
 import { getEntryForDate, hasDailyEntry, getRecentEntries, computeStats, painLogToCSV, DEFAULT_REHAB_CONFIG, STRENGTH_CATEGORIES, getRehabCountForDate, wasExerciseDone, getRehabStreak, getRehabGridData, computeRehabStats } from './painTracking.js';
@@ -127,6 +131,12 @@ export default function App() {
   const [showMethodModal, setShowMethodModal] = useState(false);
   // When adding an unscheduled session: { weekIdx, dayIdx } — null means closed
   const [addSessionTarget, setAddSessionTarget] = useState(null);
+  // Strava: tokens for this browser, sync settings, and UI state
+  const [stravaAuth, setStravaAuth] = useState(null);          // { accessToken, refreshToken, expiresAt, athlete }
+  const [stravaMeta, setStravaMeta] = useState({ lastSync: null, includeStrength: false }); // sync settings/history
+  const [stravaStatus, setStravaStatus] = useState(null);      // { configured, callbackDomain } from the server
+  const [stravaSyncing, setStravaSyncing] = useState(false);
+  const [toast, setToast] = useState(null);
 
   useEffect(() => {
     const load = async () => {
@@ -179,6 +189,14 @@ export default function App() {
       try {
         const rl = await storage.get('rehabLog');
         if (rl) setRehabLog(JSON.parse(rl.value));
+      } catch {}
+      try {
+        const sa = await storage.get('stravaAuth');
+        if (sa) setStravaAuth(JSON.parse(sa.value));
+      } catch {}
+      try {
+        const sm = await storage.get('stravaMeta');
+        if (sm) setStravaMeta(prev => ({ ...prev, ...JSON.parse(sm.value) }));
       } catch {}
       setLoading(false);
     };
@@ -548,6 +566,119 @@ export default function App() {
     });
   };
 
+  // ── Strava ──────────────────────────────────────────────────────────────
+  // Latest state for async sync code (avoids acting on a stale render).
+  const latest = useRef({});
+  latest.current = { plan, completions, skipped, logs, stravaAuth, stravaMeta };
+  const syncInFlight = useRef(false);
+
+  const showToast = useCallback((text, tone = 'info') => {
+    setToast({ text, tone, id: Date.now() });
+  }, []);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const saveStravaAuth = useCallback(async (a) => {
+    if (a) await storage.set('stravaAuth', JSON.stringify(a));
+    else await storage.delete('stravaAuth');
+  }, []);
+  const saveStravaMeta = useCallback(async (m) => { await storage.set('stravaMeta', JSON.stringify(m)); }, []);
+
+  const updateStravaMeta = (patch) => {
+    const next = { ...latest.current.stravaMeta, ...patch };
+    setStravaMeta(next);
+    saveStravaMeta(next);
+  };
+
+  // Pull new Strava activities and merge them into the plan.
+  // silent: no toast when nothing changed (used for automatic syncs).
+  const syncStrava = useCallback(async ({ silent = false } = {}) => {
+    const { plan: p, completions: c, skipped: sk, logs: l, stravaAuth: auth, stravaMeta: meta } = latest.current;
+    if (!auth || !p || !p.length || syncInFlight.current) return;
+    syncInFlight.current = true;
+    setStravaSyncing(true);
+    try {
+      const { auth: fresh, changed } = await ensureFreshAuth(auth);
+      if (changed) { setStravaAuth(fresh); saveStravaAuth(fresh); }
+
+      // Look back from the last sync (with a 3-day overlap for late uploads),
+      // or from the start of the plan on the first sync.
+      const planStart = Date.parse(p[0].days[0].date + 'T00:00:00');
+      const lastSync = meta.lastSync ? Date.parse(meta.lastSync) - 3 * 86400000 : planStart;
+      const after = Math.floor(Math.max(planStart, lastSync) / 1000) - 86400; // UTC/local slack
+      const activities = await fetchActivitiesSince(fresh.accessToken, after);
+
+      const now = latest.current; // state may have changed while we were fetching
+      const r = mergeStravaActivities({
+        plan: now.plan, completions: now.completions, skipped: now.skipped, logs: now.logs,
+        activities, includeStrength: !!meta.includeStrength,
+      });
+      const s = r.summary;
+      const changedAnything = s.matched + s.extrasAdded + s.crossAdded + s.strengthAdded + s.keptManual > 0;
+      if (changedAnything) {
+        setPlan(r.plan); savePlan(r.plan);
+        setCompletions(r.completions); saveCompletions(r.completions);
+        setSkipped(r.skipped); saveSkipped(r.skipped);
+        setLogs(r.logs); saveLogs(r.logs);
+      }
+      const lastResult = { at: new Date().toISOString(), text: describeSummary(s), details: s.details.slice(-12) };
+      updateStravaMeta({ lastSync: lastResult.at, lastResult });
+      if (changedAnything || !silent) showToast(lastResult.text, 'success');
+    } catch (e) {
+      if (e.status === 401 || /refresh token|invalid|authorization/i.test(e.message || '')) {
+        showToast('Strava needs to be reconnected (Setup → Strava).', 'error');
+      } else if (!silent) {
+        showToast(`Strava sync failed: ${e.message}`, 'error');
+      }
+    } finally {
+      syncInFlight.current = false;
+      setStravaSyncing(false);
+    }
+  }, [savePlan, saveCompletions, saveSkipped, saveLogs, saveStravaAuth, showToast]);
+
+  // Auto-sync when the app opens and whenever it comes back to the foreground,
+  // at most every 15 minutes.
+  useEffect(() => {
+    if (loading) return;
+    const maybeSync = () => {
+      const { stravaAuth: a, stravaMeta: m, plan: p } = latest.current;
+      if (!a || !p) return;
+      const last = m.lastSync ? Date.parse(m.lastSync) : 0;
+      if (Date.now() - last > 15 * 60 * 1000) syncStrava({ silent: true });
+    };
+    maybeSync();
+    const onVis = () => { if (document.visibilityState === 'visible') maybeSync(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [loading, stravaAuth, syncStrava]);
+
+  // Ask the server whether Strava keys are set up (for the Setup screen).
+  useEffect(() => {
+    if (view !== 'setup' || stravaStatus) return;
+    fetchStravaStatus().then(setStravaStatus).catch(() => setStravaStatus({ configured: false, unreachable: true }));
+  }, [view, stravaStatus]);
+
+  const connectStravaWithCode = (code) => {
+    const a = decodeConnectionCode(code); // throws with a readable message
+    setStravaAuth(a);
+    saveStravaAuth(a);
+    updateStravaMeta({ lastSync: null });
+    showToast(`Strava connected${a.athlete?.firstname ? ` as ${a.athlete.firstname}` : ''} — importing your runs…`, 'success');
+    setTimeout(() => syncStrava(), 50);
+  };
+
+  const disconnectStrava = async () => {
+    if (!confirm('Disconnect Strava? Runs already imported stay in your plan.')) return;
+    const a = latest.current.stravaAuth;
+    if (a?.accessToken) deauthorizeStrava(a.accessToken);
+    setStravaAuth(null);
+    saveStravaAuth(null);
+    updateStravaMeta({ lastSync: null, lastResult: null });
+  };
+
   const handleBackup = () => {
     const backup = {
       version: 6,
@@ -645,6 +776,18 @@ export default function App() {
             <NorwegianFlag />
             <h1 className="font-semibold text-sm md:text-base text-slate-900">Singles Planner</h1>
           </div>
+          <div className="flex items-center gap-2">
+          {plan && stravaAuth && (
+            <button
+              onClick={() => syncStrava()}
+              disabled={stravaSyncing}
+              className="text-xs px-3 py-1.5 bg-orange-50 text-orange-800 hover:bg-orange-100 border border-orange-200 rounded-md flex items-center gap-1 transition disabled:opacity-60"
+              title="Import new activities from Strava"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${stravaSyncing ? 'animate-spin' : ''}`} />
+              <span>{stravaSyncing ? 'Syncing…' : 'Strava'}</span>
+            </button>
+          )}
           {plan && view !== 'setup' && (
             <button
               onClick={() => downloadICS(plan)}
@@ -656,13 +799,47 @@ export default function App() {
               <span className="sm:hidden">.ics</span>
             </button>
           )}
+          </div>
         </div>
       </header>
+
+      {/* Toast (Strava sync results) */}
+      {toast && (
+        <div
+          className="fixed left-1/2 -translate-x-1/2 z-30 max-w-sm w-[calc(100%-2rem)]"
+          style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 5.5rem)' }}
+          role="status"
+        >
+          <button
+            onClick={() => setToast(null)}
+            className={`w-full text-left text-sm px-4 py-3 rounded-lg shadow-lg border ${
+              toast.tone === 'error'
+                ? 'bg-rose-50 border-rose-200 text-rose-900'
+                : 'bg-slate-900 border-slate-900 text-white'
+            }`}
+          >
+            {toast.text}
+          </button>
+        </div>
+      )}
 
       <main
         className="max-w-5xl mx-auto px-4 py-4"
         style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 5rem)' }}
       >
+        {view === 'setup' && (
+          <StravaSection
+            status={stravaStatus}
+            auth={stravaAuth}
+            meta={stravaMeta}
+            hasPlan={!!plan}
+            syncing={stravaSyncing}
+            onSync={() => syncStrava()}
+            onPasteCode={connectStravaWithCode}
+            onDisconnect={disconnectStrava}
+            onToggleStrength={(v) => updateStravaMeta({ includeStrength: v })}
+          />
+        )}
         {view === 'setup' && (
           <SetupForm
             setup={setup}
@@ -797,6 +974,159 @@ export default function App() {
           }}
           onClose={() => setAddSessionTarget(null)}
         />
+      )}
+    </div>
+  );
+}
+
+// Strava connection panel (top of the Setup tab)
+function StravaSection({ status, auth, meta, hasPlan, syncing, onSync, onPasteCode, onDisconnect, onToggleStrength }) {
+  const [showPaste, setShowPaste] = useState(false);
+  const [code, setCode] = useState('');
+  const [pasteError, setPasteError] = useState('');
+  const [showDetails, setShowDetails] = useState(false);
+  const isHomeScreenApp = typeof window !== 'undefined' &&
+    ((window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true);
+
+  const fmtWhen = (iso) => {
+    if (!iso) return 'never';
+    const d = new Date(iso);
+    const mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    return d.toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  };
+
+  const submitCode = () => {
+    setPasteError('');
+    try {
+      onPasteCode(code);
+      setCode('');
+      setShowPaste(false);
+    } catch (e) {
+      setPasteError(e.message);
+    }
+  };
+
+  const pasteFromClipboard = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      if (t) setCode(t.trim());
+    } catch {
+      setPasteError('Couldn’t read the clipboard — long-press the box and choose Paste.');
+    }
+  };
+
+  const header = (
+    <div className="flex items-center gap-2 mb-1">
+      <span className="h-6 w-6 rounded-md bg-orange-500 text-white flex items-center justify-center">
+        <Link2 className="h-3.5 w-3.5" />
+      </span>
+      <h2 className="text-base font-semibold text-slate-900">Strava</h2>
+      {auth && <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 rounded px-1.5 py-0.5">CONNECTED</span>}
+    </div>
+  );
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 p-5 max-w-2xl mb-4">
+      {header}
+
+      {auth ? (
+        <div>
+          <p className="text-sm text-slate-700">
+            {auth.athlete?.firstname ? `Signed in as ${auth.athlete.firstname} ${auth.athlete.lastname || ''}. ` : ''}
+            New runs are imported automatically when you open the app. Last sync: <span className="font-medium">{fmtWhen(meta.lastSync)}</span>.
+          </p>
+          {meta.lastResult?.text && (
+            <div className="mt-2 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+              <button className="w-full text-left flex items-center justify-between" onClick={() => setShowDetails(v => !v)}>
+                <span>{meta.lastResult.text}</span>
+                {meta.lastResult.details?.length > 0 && <span className="text-slate-500 ml-2">{showDetails ? 'Hide' : 'Details'}</span>}
+              </button>
+              {showDetails && (
+                <ul className="mt-2 space-y-0.5 text-slate-600">
+                  {meta.lastResult.details.map((d, i) => <li key={i}>{d}</li>)}
+                </ul>
+              )}
+            </div>
+          )}
+          {!hasPlan && (
+            <p className="mt-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+              Generate a plan below — Strava runs are imported into your plan’s weeks.
+            </p>
+          )}
+          <label className="flex items-start gap-2 mt-3 text-sm text-slate-700">
+            <input type="checkbox" className="mt-1" checked={!!meta.includeStrength} onChange={e => onToggleStrength(e.target.checked)} />
+            <span>Also import strength and PT workouts <span className="text-slate-500">(off by default so your run calendar stays uncluttered)</span></span>
+          </label>
+          <div className="flex flex-col sm:flex-row gap-2 mt-4">
+            <button onClick={onSync} disabled={syncing || !hasPlan}
+              className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-md text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-60">
+              <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
+              {syncing ? 'Syncing…' : 'Sync now'}
+            </button>
+            <button onClick={onDisconnect}
+              className="px-4 py-2 bg-white text-slate-700 border border-slate-300 rounded-md text-sm font-medium hover:bg-slate-50">
+              Disconnect
+            </button>
+          </div>
+          <p className="text-xs text-slate-600 mt-3 leading-relaxed">
+            How runs are matched: each Strava run fills in that day’s planned run (time, distance, avg HR) and checks it off.
+            Runs with no planned session that day are added as extras; split or duplicate recordings of one workout are combined.
+            Runs you logged by hand are never overwritten.
+          </p>
+        </div>
+      ) : (
+        <div>
+          <p className="text-sm text-slate-700 mb-3">
+            Connect Strava to log your runs automatically — time, distance and average heart rate fill in, and the session is checked off.
+          </p>
+
+          {status === null && <p className="text-xs text-slate-500">Checking Strava setup…</p>}
+
+          {status && !status.configured && (
+            <div className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-3 leading-relaxed">
+              {status.unreachable
+                ? 'Couldn’t reach the Strava service for this app (it only runs on the deployed site, not on a local preview).'
+                : <>The Strava keys haven’t been added to this app’s server yet. Once <code>STRAVA_CLIENT_ID</code> and <code>STRAVA_CLIENT_SECRET</code> are set in Vercel and the app is redeployed, the Connect button will work. Strava’s “Authorization Callback Domain” should be <strong>{status.callbackDomain}</strong>.</>}
+            </div>
+          )}
+
+          {status?.configured && (
+            <a href="/api/strava?action=connect"
+              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-orange-500 hover:bg-orange-600 text-white rounded-md text-sm font-semibold w-full sm:w-auto">
+              Connect with Strava
+            </a>
+          )}
+
+          {isHomeScreenApp && status?.configured && (
+            <p className="text-xs text-slate-600 mt-3 leading-relaxed">
+              On iPhone, Strava’s sign-in opens in a separate browser window. When it says <em>Strava connected</em>, tap
+              <strong> Copy connection code</strong>, close that window, and paste the code below.
+            </p>
+          )}
+
+          <div className="mt-3">
+            <button onClick={() => setShowPaste(v => !v)} className="text-xs text-slate-700 underline underline-offset-2">
+              {showPaste ? 'Hide' : 'Paste connection code'}
+            </button>
+            {showPaste && (
+              <div className="mt-2">
+                <textarea
+                  value={code}
+                  onChange={e => setCode(e.target.value)}
+                  placeholder="Paste the code from the “Strava connected” page"
+                  className="w-full h-20 px-3 py-2 border border-slate-300 rounded-md text-xs font-mono"
+                />
+                {pasteError && <p className="text-xs text-rose-700 mt-1">{pasteError}</p>}
+                <div className="flex gap-2 mt-2">
+                  <button onClick={pasteFromClipboard} className="px-3 py-1.5 text-xs bg-slate-100 border border-slate-200 rounded-md">Paste from clipboard</button>
+                  <button onClick={submitCode} disabled={!code.trim()} className="px-3 py-1.5 text-xs bg-slate-900 text-white rounded-md disabled:opacity-50">Connect</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

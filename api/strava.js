@@ -134,7 +134,12 @@ export default async function handler(req, res) {
 
   try {
     if (action === 'status') {
-      return sendJSON(res, 200, { configured: !!(CID && CSEC), clientId: CID || null, callbackDomain: url.hostname });
+      // Names only (never values) of any Strava-looking variables, to diagnose setup typos.
+      const seen = Object.keys(process.env).filter(k => /strava|client/i.test(k)).sort();
+      return sendJSON(res, 200, {
+        configured: !!(CID && CSEC), clientId: CID || null, callbackDomain: url.hostname,
+        hasClientId: !!CID, hasClientSecret: !!CSEC, envVarNamesSeen: seen, vercelEnv: process.env.VERCEL_ENV || null,
+      });
     }
 
     if (!CID || !CSEC) {
